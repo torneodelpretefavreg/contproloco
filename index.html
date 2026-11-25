@@ -1515,10 +1515,96 @@ function testoDocumento(d) {
   return d.tipo + (d.numero ? " n. " + d.numero : "") + (dt ? " del " + dt : "");
 }
 
-// Riga del form: tendina del tipo (con "aggiungi tipo") + numero + data
-function CampoDocumento({ docTipo, setDocTipo, docNumero, setDocNumero, docData, setDocData }) {
+// ---------- ALLEGATI (PDF o foto del documento) ----------
+// Il file sta nel Realtime Database, in allegati/<id> (base64), fuori dagli esercizi:
+// cosi' non viene scaricato insieme ai movimenti ma solo quando lo si apre.
+// Nel movimento resta solo il riferimento: documento.allegato = { id, nome, tipo, dimensione }.
+const ALLEGATI_PATH = "allegati";
+const ALLEGATO_MAX_BYTE = 6 * 1024 * 1024;   // il database accetta stringhe fino a 10 MB (base64 = +33%)
+const fmtByte = (n) => n >= 1048576 ? (n / 1048576).toFixed(1).replace(".", ",") + " MB" : Math.max(1, Math.round(n / 1024)) + " KB";
+
+function leggiComeBase64(blob) {
+  return new Promise((ok, ko) => {
+    const r = new FileReader();
+    r.onload = () => ok(String(r.result).split(",")[1] || "");
+    r.onerror = () => ko(r.error || new Error("lettura non riuscita"));
+    r.readAsDataURL(blob);
+  });
+}
+
+// Le foto del telefono pesano molto: le riduco a 2000 px di lato, in JPEG.
+async function riduciImmagine(file) {
+  if (!/^image\//.test(file.type) || file.size < 1.5 * 1024 * 1024) return file;
+  try {
+    const url = URL.createObjectURL(file);
+    const img = await new Promise((ok, ko) => { const i = new Image(); i.onload = () => ok(i); i.onerror = ko; i.src = url; });
+    const k = Math.min(1, 2000 / Math.max(img.width, img.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    URL.revokeObjectURL(url);
+    const blob = await new Promise(ok => c.toBlob(ok, "image/jpeg", 0.85));
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], file.name.replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg" });
+  } catch (e) { return file; }
+}
+
+async function caricaAllegato(file) {
+  const f = await riduciImmagine(file);
+  if (f.size > ALLEGATO_MAX_BYTE) throw new Error(`Il file pesa ${fmtByte(f.size)}: il massimo è ${fmtByte(ALLEGATO_MAX_BYTE)}.`);
+  const dati = await leggiComeBase64(f);
+  const ref = db.ref(ALLEGATI_PATH).push();
+  const meta = { id: ref.key, nome: f.name || "documento", tipo: f.type || "application/octet-stream", dimensione: f.size };
+  await ref.set({ ...meta, dati, caricatoIl: new Date().toISOString() });
+  return meta;
+}
+
+// Apre l'allegato in una nuova scheda. La finestra si apre subito (prima di
+// leggere il database), altrimenti Safari su iPhone la blocca come popup.
+async function apriAllegato(a) {
+  if (!a || !a.id) return;
+  const w = window.open("", "_blank");
+  try {
+    if (w) w.document.write("<p style='font:16px sans-serif;padding:20px'>Apro il documento…</p>");
+    const snap = await db.ref(`${ALLEGATI_PATH}/${a.id}`).once("value");
+    const v = snap.val();
+    if (!v || !v.dati) throw new Error("Allegato non trovato nel database.");
+    const bin = atob(v.dati); const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([arr], { type: v.tipo || a.tipo || "application/pdf" }));
+    if (w) w.location.href = url;
+    else { const l = document.createElement("a"); l.href = url; l.download = v.nome || a.nome || "documento"; document.body.appendChild(l); l.click(); l.remove(); }
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+  } catch (e) {
+    if (w) w.close();
+    alert("Non riesco ad aprire l'allegato: " + e.message);
+  }
+}
+
+// Riga del form: tendina del tipo (con "aggiungi tipo") + numero + data + allegato
+function CampoDocumento({ docTipo, setDocTipo, docNumero, setDocNumero, docData, setDocData, docAllegato, setDocAllegato }) {
   const { base, custom, aggiungi, rimuovi } = useTipiDocumento();
   const tutti = [...base, ...custom];
+  const [caricando, setCaricando] = useState(false);
+  const fileRef = useRef(null);
+  // id caricati in questa finestra e non ancora salvati: se li sostituisco li cancello
+  const nuoviRef = useRef(new Set());
+  const scegliFile = async (e) => {
+    const f = e.target.files && e.target.files[0]; e.target.value = "";
+    if (!f) return;
+    setCaricando(true);
+    try {
+      const meta = await caricaAllegato(f);
+      if (docAllegato && nuoviRef.current.has(docAllegato.id)) db.ref(`${ALLEGATI_PATH}/${docAllegato.id}`).remove().catch(() => {});
+      nuoviRef.current.add(meta.id);
+      setDocAllegato(meta);
+    } catch (err) { alert("Caricamento non riuscito: " + err.message); }
+    setCaricando(false);
+  };
+  const togliFile = () => {
+    if (docAllegato && nuoviRef.current.has(docAllegato.id)) db.ref(`${ALLEGATI_PATH}/${docAllegato.id}`).remove().catch(() => {});
+    setDocAllegato(null);
+  };
   const scegli = async (v) => {
     if (v !== "__nuovo__") { setDocTipo(v); return; }
     const nome = prompt("Nuovo tipo di documento (es. Preventivo, Verbale, Bolla):", "");
@@ -1556,6 +1642,24 @@ function CampoDocumento({ docTipo, setDocTipo, docNumero, setDocNumero, docData,
           </>
         )}
       </div>
+      {docTipo && (
+        <div style={{display:"flex", gap:8, alignItems:"center", flexWrap:"wrap", marginTop:8, fontSize:13}}>
+          <input ref={fileRef} type="file" accept="application/pdf,image/*" style={{display:"none"}} onChange={scegliFile} />
+          {docAllegato ? (
+            <>
+              <span>📎 <a href="#" onClick={e => { e.preventDefault(); apriAllegato(docAllegato); }}>{docAllegato.nome}</a>
+                <span style={{color:"var(--ink-3)"}}> · {fmtByte(docAllegato.dimensione || 0)}</span></span>
+              <button type="button" className="btn ghost sm" onClick={() => fileRef.current && fileRef.current.click()} disabled={caricando}>Sostituisci</button>
+              <button type="button" className="btn ghost sm" onClick={togliFile} disabled={caricando}>Togli</button>
+            </>
+          ) : (
+            <button type="button" className="btn ghost sm" onClick={() => fileRef.current && fileRef.current.click()} disabled={caricando}>
+              {caricando ? "Carico…" : "📎 Allega PDF o foto"}
+            </button>
+          )}
+          {caricando && docAllegato && <span style={{color:"var(--ink-3)"}}>Carico…</span>}
+        </div>
+      )}
       {docTipo && custom.includes(docTipo) && (
         <div style={{fontSize:11.5, marginTop:4}}>
           <a href="#" onClick={e => { e.preventDefault(); elimina(); }} style={{color:"var(--ink-3)"}}>Togli “{docTipo}” dall'elenco</a>
@@ -1596,9 +1700,10 @@ function MovimentoForm({ conti, onSave, onCancel, mov = null, categorie = { entr
   const [docTipo, setDocTipo] = useState(mov?.documento?.tipo || "");
   const [docNumero, setDocNumero] = useState(mov?.documento?.numero || "");
   const [docData, setDocData] = useState(mov?.documento?.data || "");
-  const documento = docTipo ? { tipo: docTipo, numero: String(docNumero || "").trim(), data: docData || "" } : null;
+  const [docAllegato, setDocAllegato] = useState(mov?.documento?.allegato || null);
+  const documento = docTipo ? { tipo: docTipo, numero: String(docNumero || "").trim(), data: docData || "", allegato: docAllegato || null } : null;
   const campoDocumento = <CampoDocumento docTipo={docTipo} setDocTipo={setDocTipo} docNumero={docNumero}
-    setDocNumero={setDocNumero} docData={docData} setDocData={setDocData} />;
+    setDocNumero={setDocNumero} docData={docData} setDocData={setDocData} docAllegato={docAllegato} setDocAllegato={setDocAllegato} />;
 
   // === Scrittura libera multi-riga ===
   const [righe, setRighe] = useState([
@@ -3318,7 +3423,8 @@ function PageMovimenti({ conti, movimenti, saldiIniziali, stagione, categorie, o
                     </td>
                     <td>
                       {m.descrizione || <span style={{color:"var(--ink-3)"}}>—</span>}
-                      {m.documento && m.documento.tipo && <div style={{fontSize:11, color:"var(--ink-3)", marginTop:2}}>📄 {testoDocumento(m.documento)}</div>}
+                      {m.documento && m.documento.tipo && <div style={{fontSize:11, color:"var(--ink-3)", marginTop:2}}>📄 {testoDocumento(m.documento)}
+                        {m.documento.allegato && <> · <a href="#" title={m.documento.allegato.nome} onClick={e => { e.preventDefault(); apriAllegato(m.documento.allegato); }}>📎 apri</a></>}</div>}
                     </td>
                     <td><span className="pill">{m.bu || "—"}</span></td>
                     <td className={"num " + (m.apertura ? "" : m.tipo === "uscita" ? "neg" : m.tipo === "entrata" ? "pos" : "")}>
