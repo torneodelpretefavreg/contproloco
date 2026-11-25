@@ -1474,7 +1474,7 @@ function Login({ onLogin }) {
 // ============================================================
 // DOCUMENTO DEL MOVIMENTO (fattura, ricevuta, ...)
 // Ogni movimento puo' portare il documento che lo giustifica:
-//   documento: { tipo, numero, data }
+//   documento: { tipo, numero, dataDocumento, allegato }
 // I tipi di base sono fissi; quelli aggiunti dall'utente sono comuni a tutti
 // gli esercizi e stanno in impostazioni/tipiDocumento (elenco di nomi).
 // ============================================================
@@ -1511,7 +1511,8 @@ function useTipiDocumento() {
 // "Fattura n. 12 del 03/05/2025"
 function testoDocumento(d) {
   if (!d || !d.tipo) return "";
-  const dt = d.data && /^\d{4}-\d{2}-\d{2}$/.test(d.data) ? d.data.slice(8, 10) + "/" + d.data.slice(5, 7) + "/" + d.data.slice(0, 4) : "";
+  const dd = d.dataDocumento || d.data || "";
+  const dt = /^\d{4}-\d{2}-\d{2}$/.test(dd) ? dd.slice(8, 10) + "/" + dd.slice(5, 7) + "/" + dd.slice(0, 4) : "";
   return d.tipo + (d.numero ? " n. " + d.numero : "") + (dt ? " del " + dt : "");
 }
 
@@ -1669,6 +1670,56 @@ function CampoDocumento({ docTipo, setDocTipo, docNumero, setDocNumero, docData,
   );
 }
 
+// Finestra rapida dalla lista Movimenti: aggiunge o cambia solo il documento
+// (e l'allegato) di un movimento gia' registrato, senza riaprire tutto il form.
+// Per una scrittura libera il documento va su tutte le sue righe.
+function DocumentoModal({ mov, movimenti, stagione, onClose, onToast }) {
+  const [docTipo, setDocTipo] = useState(mov?.documento?.tipo || "");
+  const [docNumero, setDocNumero] = useState(mov?.documento?.numero || "");
+  const [docData, setDocData] = useState(mov?.documento?.dataDocumento || mov?.documento?.data || "");
+  const [docAllegato, setDocAllegato] = useState(mov?.documento?.allegato || null);
+  const [salvando, setSalvando] = useState(false);
+  const salva = async () => {
+    const documento = docTipo ? { tipo: docTipo, numero: String(docNumero || "").trim(), dataDocumento: docData || "", allegato: docAllegato || null } : null;
+    const ids = mov.scritturaComposta && mov.scritturaId
+      ? (movimenti || []).filter(m => m.scritturaId === mov.scritturaId).map(m => m._id)
+      : [mov._id];
+    const now = new Date().toISOString();
+    const upd = {};
+    ids.forEach(id => { upd[`${id}/documento`] = documento; upd[`${id}/modificatoIl`] = now; });
+    setSalvando(true);
+    try {
+      await db.ref(`stagioni/${stagione}/movimenti`).update(upd);
+      onToast && onToast(documento ? "Documento salvato" : "Documento tolto");
+      onClose();
+    } catch (e) { alert("Errore: " + e.message); setSalvando(false); }
+  };
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{maxWidth:640}}>
+        <div className="modal-head">
+          <h3>Documento del movimento</h3>
+          <button className="btn ghost sm" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <div style={{fontSize:13, color:"var(--ink-2)", marginBottom:12}}>
+            {fmtDate(mov.data)} · {mov.descrizione || mov.categoria || "—"} · <b>{fmt(mov.importo)} €</b>
+            {mov.scritturaComposta && <div style={{fontSize:12, color:"var(--ink-3)", marginTop:4}}>Scrittura libera: il documento va su tutte le sue righe.</div>}
+          </div>
+          <div className="form-grid">
+            <CampoDocumento docTipo={docTipo} setDocTipo={setDocTipo} docNumero={docNumero} setDocNumero={setDocNumero}
+              docData={docData} setDocData={setDocData} docAllegato={docAllegato} setDocAllegato={setDocAllegato} />
+          </div>
+          <div className="form-actions" style={{display:"flex", justifyContent:"flex-end", gap:8, marginTop:12, paddingTop:14, borderTop:"1px solid var(--rule)"}}>
+            <button type="button" className="btn ghost" onClick={onClose}>Annulla</button>
+            <button type="button" className="btn accent" onClick={salva} disabled={salvando}>{salvando ? "Salvo…" : "Salva documento"}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MovimentoForm({ conti, onSave, onCancel, mov = null, categorie = { entrate: [], uscite: [] }, movimenti = null, saldiIniziali = null }) {
   // Saldi correnti dei conti (come nei gestionali: selezioni il conto e vedi subito il saldo).
   // In modifica escludo il movimento stesso, così "dopo" è il saldo con la versione corretta.
@@ -1699,9 +1750,9 @@ function MovimentoForm({ conti, onSave, onCancel, mov = null, categorie = { entr
   // Documento che giustifica il movimento (facoltativo)
   const [docTipo, setDocTipo] = useState(mov?.documento?.tipo || "");
   const [docNumero, setDocNumero] = useState(mov?.documento?.numero || "");
-  const [docData, setDocData] = useState(mov?.documento?.data || "");
+  const [docData, setDocData] = useState(mov?.documento?.dataDocumento || mov?.documento?.data || "");
   const [docAllegato, setDocAllegato] = useState(mov?.documento?.allegato || null);
-  const documento = docTipo ? { tipo: docTipo, numero: String(docNumero || "").trim(), data: docData || "", allegato: docAllegato || null } : null;
+  const documento = docTipo ? { tipo: docTipo, numero: String(docNumero || "").trim(), dataDocumento: docData || "", allegato: docAllegato || null } : null;
   const campoDocumento = <CampoDocumento docTipo={docTipo} setDocTipo={setDocTipo} docNumero={docNumero}
     setDocNumero={setDocNumero} docData={docData} setDocData={setDocData} docAllegato={docAllegato} setDocAllegato={setDocAllegato} />;
 
@@ -3101,6 +3152,7 @@ function CespiteFormQuick({ cespite, onSave, onSkip }) {
 // PAGINA: LISTA MOVIMENTI
 // ============================================================
 function PageMovimenti({ conti, movimenti, saldiIniziali, stagione, categorie, onToast }) {
+  const [docMov, setDocMov] = useState(null);   // movimento di cui modifico solo il documento
   const [filterTipo, setFilterTipo] = useState("");
   const [filterMese, setFilterMese] = useState("");
   const [filterBu, setFilterBu] = useState("");
@@ -3432,6 +3484,8 @@ function PageMovimenti({ conti, movimenti, saldiIniziali, stagione, categorie, o
                     </td>
                     <td>
                       <div style={{display:"flex", gap:4}}>
+                        <button className="btn ghost sm" title={m.documento && m.documento.tipo ? "Documento: " + testoDocumento(m.documento) : "Aggiungi documento"}
+                                style={m.documento && m.documento.tipo ? {} : {opacity:0.55}} onClick={() => setDocMov(m)}>📎</button>
                         <button className="btn ghost sm" onClick={() => setEditing(m)}>✎</button>
                         <button className="btn danger sm" onClick={() => handleDelete(m._id)}>🗑</button>
                       </div>
@@ -3542,6 +3596,7 @@ function PageMovimenti({ conti, movimenti, saldiIniziali, stagione, categorie, o
         </div>
       )}
 
+      {docMov && <DocumentoModal mov={docMov} movimenti={movimenti} stagione={stagione} onClose={() => setDocMov(null)} onToast={onToast} />}
       {editing && (
         <div className="modal-bg" onClick={() => setEditing(null)}>
           <div className="modal" onClick={e => e.stopPropagation()}>
