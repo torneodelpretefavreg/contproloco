@@ -1471,6 +1471,100 @@ function Login({ onLogin }) {
 // ============================================================
 // MOVIMENTO FORM
 // ============================================================
+// ============================================================
+// DOCUMENTO DEL MOVIMENTO (fattura, ricevuta, ...)
+// Ogni movimento puo' portare il documento che lo giustifica:
+//   documento: { tipo, numero, data }
+// I tipi di base sono fissi; quelli aggiunti dall'utente sono comuni a tutti
+// gli esercizi e stanno in impostazioni/tipiDocumento (elenco di nomi).
+// ============================================================
+const TIPI_DOCUMENTO_BASE = ["Fattura", "Nota di credito", "Ricevuta", "Scontrino", "Autocertificazione",
+  "Estratto conto", "F24", "Contratto", "Distinta di versamento", "Altro"];
+const TIPI_DOC_PATH = "impostazioni/tipiDocumento";
+
+function useTipiDocumento() {
+  const [custom, setCustom] = useState([]);
+  useEffect(() => {
+    if (!firebaseReady) return;
+    const ref = db.ref(TIPI_DOC_PATH);
+    const cb = ref.on("value", snap => {
+      const v = snap.val();
+      const arr = Array.isArray(v) ? v : (v ? Object.values(v) : []);
+      setCustom(arr.filter(x => typeof x === "string" && x.trim()));
+    }, () => {});
+    return () => ref.off("value", cb);
+  }, []);
+  const aggiungi = async (nome) => {
+    const n = String(nome || "").trim();
+    if (!n) return null;
+    const esiste = [...TIPI_DOCUMENTO_BASE, ...custom].find(x => x.toLowerCase() === n.toLowerCase());
+    if (esiste) return esiste;
+    await db.ref(TIPI_DOC_PATH).set([...custom, n]);
+    return n;
+  };
+  const rimuovi = async (nome) => {
+    await db.ref(TIPI_DOC_PATH).set(custom.filter(x => x !== nome));
+  };
+  return { base: TIPI_DOCUMENTO_BASE, custom, aggiungi, rimuovi };
+}
+
+// "Fattura n. 12 del 03/05/2025"
+function testoDocumento(d) {
+  if (!d || !d.tipo) return "";
+  const dt = d.data && /^\d{4}-\d{2}-\d{2}$/.test(d.data) ? d.data.slice(8, 10) + "/" + d.data.slice(5, 7) + "/" + d.data.slice(0, 4) : "";
+  return d.tipo + (d.numero ? " n. " + d.numero : "") + (dt ? " del " + dt : "");
+}
+
+// Riga del form: tendina del tipo (con "aggiungi tipo") + numero + data
+function CampoDocumento({ docTipo, setDocTipo, docNumero, setDocNumero, docData, setDocData }) {
+  const { base, custom, aggiungi, rimuovi } = useTipiDocumento();
+  const tutti = [...base, ...custom];
+  const scegli = async (v) => {
+    if (v !== "__nuovo__") { setDocTipo(v); return; }
+    const nome = prompt("Nuovo tipo di documento (es. Preventivo, Verbale, Bolla):", "");
+    if (!nome || !nome.trim()) return;
+    try { const n = await aggiungi(nome); if (n) setDocTipo(n); }
+    catch (e) { alert("Non riesco a salvare il nuovo tipo: " + e.message); }
+  };
+  const elimina = async () => {
+    if (!confirm(`Togliere "${docTipo}" dall'elenco dei tipi di documento?\n\nI movimenti già registrati con questo tipo non cambiano.`)) return;
+    try { await rimuovi(docTipo); } catch (e) { alert("Errore: " + e.message); }
+  };
+  return (
+    <div className="form-row">
+      <label>Documento <span style={{color:"var(--ink-3)", fontSize:11}}>(opzionale)</span></label>
+      <div style={{display:"flex", gap:8, flexWrap:"wrap", alignItems:"center"}}>
+        <select value={docTipo} onChange={e => scegli(e.target.value)} style={{flex:"1 1 170px", minWidth:0}}>
+          <option value="">— nessun documento —</option>
+          <optgroup label="Tipi di base">
+            {base.map(t => <option key={t} value={t}>{t}</option>)}
+          </optgroup>
+          {custom.length > 0 && (
+            <optgroup label="Tipi aggiunti">
+              {custom.map(t => <option key={t} value={t}>{t}</option>)}
+            </optgroup>
+          )}
+          {docTipo && !tutti.includes(docTipo) && <option value={docTipo}>{docTipo}</option>}
+          <option value="__nuovo__">＋ Aggiungi tipo…</option>
+        </select>
+        {docTipo && (
+          <>
+            <input type="text" value={docNumero} onChange={e => setDocNumero(e.target.value)}
+                   placeholder="Numero" style={{flex:"1 1 110px", minWidth:0}} />
+            <input type="date" value={docData} onChange={e => setDocData(e.target.value)}
+                   title="Data del documento" style={{flex:"0 1 150px", minWidth:0}} />
+          </>
+        )}
+      </div>
+      {docTipo && custom.includes(docTipo) && (
+        <div style={{fontSize:11.5, marginTop:4}}>
+          <a href="#" onClick={e => { e.preventDefault(); elimina(); }} style={{color:"var(--ink-3)"}}>Togli “{docTipo}” dall'elenco</a>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MovimentoForm({ conti, onSave, onCancel, mov = null, categorie = { entrate: [], uscite: [] }, movimenti = null, saldiIniziali = null }) {
   // Saldi correnti dei conti (come nei gestionali: selezioni il conto e vedi subito il saldo).
   // In modifica escludo il movimento stesso, così "dopo" è il saldo con la versione corretta.
@@ -1498,6 +1592,13 @@ function MovimentoForm({ conti, onSave, onCancel, mov = null, categorie = { entr
   // Contropartita esplicita per movimenti NON monetari (no conto liquidità):
   // evita che l'app usi di default 60/35. Vuota = "da assegnare".
   const [contoContropartita, setContoContropartita] = useState(mov?.contoContropartita ?? "");
+  // Documento che giustifica il movimento (facoltativo)
+  const [docTipo, setDocTipo] = useState(mov?.documento?.tipo || "");
+  const [docNumero, setDocNumero] = useState(mov?.documento?.numero || "");
+  const [docData, setDocData] = useState(mov?.documento?.data || "");
+  const documento = docTipo ? { tipo: docTipo, numero: String(docNumero || "").trim(), data: docData || "" } : null;
+  const campoDocumento = <CampoDocumento docTipo={docTipo} setDocTipo={setDocTipo} docNumero={docNumero}
+    setDocNumero={setDocNumero} docData={docData} setDocData={setDocData} />;
 
   // === Scrittura libera multi-riga ===
   const [righe, setRighe] = useState([
@@ -1609,6 +1710,7 @@ function MovimentoForm({ conti, onSave, onCancel, mov = null, categorie = { entr
           scritturaId,
           dare: isDare ? importo : 0,
           avere: isDare ? 0 : importo,
+          documento,
           creatoIl: new Date().toISOString(),
           modificatoIl: new Date().toISOString()
         };
@@ -1649,6 +1751,7 @@ function MovimentoForm({ conti, onSave, onCancel, mov = null, categorie = { entr
       descrizione: descrizione || "",
       mese: meseDaData(data),
       nonMonetario,
+      documento,
       creatoIl: mov?.creatoIl || new Date().toISOString(),
       modificatoIl: new Date().toISOString()
     };
@@ -1688,6 +1791,7 @@ function MovimentoForm({ conti, onSave, onCancel, mov = null, categorie = { entr
               {BUSINESS_UNITS.map(b => <option key={b} value={b}>{b}</option>)}
             </select>
           </div>
+          {campoDocumento}
 
           <div style={{marginTop:8, padding:"12px 14px", background:"#f5f0ff", border:"1px solid #d4c4f7", borderRadius:8, fontSize:12.5, color:"#5b3aa3"}}>
             <strong>📓 Scrittura in partita doppia.</strong> Inserisci almeno 2 righe. Per ogni riga: scegli il conto e indica l'importo in DARE oppure in AVERE (non entrambi). Il totale DARE deve coincidere con il totale AVERE.
@@ -1933,6 +2037,7 @@ function MovimentoForm({ conti, onSave, onCancel, mov = null, categorie = { entr
         <label>Descrizione</label>
         <textarea value={descrizione} onChange={e => setDescrizione(e.target.value)} placeholder="Motivo / dettaglio operazione" />
       </div>
+      {campoDocumento}
       <div className="form-actions" style={{display:"flex", justifyContent:"flex-end", gap:8, marginTop:12, paddingTop:14, borderTop:"1px solid var(--rule)"}}>
         <button type="button" className="btn ghost" onClick={onCancel}>Annulla</button>
         <button type="submit" className="btn accent">Salva movimento</button>
@@ -3057,7 +3162,8 @@ function PageMovimenti({ conti, movimenti, saldiIniziali, stagione, categorie, o
         if (!filterText) return true;
         const t = filterText.toLowerCase();
         return (m.descrizione || "").toLowerCase().includes(t)
-          || (m.categoria || "").toLowerCase().includes(t);
+          || (m.categoria || "").toLowerCase().includes(t)
+          || testoDocumento(m.documento).toLowerCase().includes(t);
       })
       .sort((a,b) => {
         // ordinamento primario: data decrescente
@@ -3076,6 +3182,8 @@ function PageMovimenti({ conti, movimenti, saldiIniziali, stagione, categorie, o
       }
       // Pulisco i campi undefined prima del set (Firebase li rifiuta)
       const dati = {...payload, importato: editing.importato || false};
+      // il set sostituisce l'intero movimento: conservo i campi che il form non gestisce
+      ["note", "rifPrimaNota"].forEach(k => { if (editing[k] != null && dati[k] === undefined) dati[k] = editing[k]; });
       Object.keys(dati).forEach(k => { if (dati[k] === undefined) dati[k] = null; });
       await db.ref(`stagioni/${stagione}/movimenti/${editing._id}`).set(dati);
       onToast("Movimento aggiornato");
@@ -3208,7 +3316,10 @@ function PageMovimenti({ conti, movimenti, saldiIniziali, stagione, categorie, o
                         ? <div style={{fontSize:11, color:"var(--ink-3)", marginTop:2}}>↳ contropartita 60 · Bilancio di Apertura</div>
                         : (m.categoria && <div style={{fontSize:11, color:"var(--ink-3)", marginTop:2}}>{m.categoria}</div>)}
                     </td>
-                    <td>{m.descrizione || <span style={{color:"var(--ink-3)"}}>—</span>}</td>
+                    <td>
+                      {m.descrizione || <span style={{color:"var(--ink-3)"}}>—</span>}
+                      {m.documento && m.documento.tipo && <div style={{fontSize:11, color:"var(--ink-3)", marginTop:2}}>📄 {testoDocumento(m.documento)}</div>}
+                    </td>
                     <td><span className="pill">{m.bu || "—"}</span></td>
                     <td className={"num " + (m.apertura ? "" : m.tipo === "uscita" ? "neg" : m.tipo === "entrata" ? "pos" : "")}>
                       {m.apertura ? "" : m.tipo === "uscita" ? "−" : m.tipo === "entrata" ? "+" : "⇄"} {fmt(m.importo)}
