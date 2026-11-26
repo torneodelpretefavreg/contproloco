@@ -1541,6 +1541,251 @@ const ERRORI_AUTH = {
 };
 const testoErroreAuth = (e) => ERRORI_AUTH[e && e.code] || ((e && e.message) || "Operazione non riuscita.");
 
+// ============================================================
+// ACCESSO RAPIDO: codice oppure Face ID / Touch ID / impronta.
+// Vale solo sul dispositivo dove lo si attiva. La sessione Firebase resta
+// salvata sul dispositivo (come "Resta connesso"); all'apertura dell'app, e
+// quando ci si torna dopo qualche minuto, l'app resta coperta finche' non si
+// mette il codice o si passa il riconoscimento. L'email e la password servono
+// sempre la prima volta, dopo "Esci" e dopo 5 codici sbagliati.
+// Il codice non e' salvato: si salva solo la sua impronta (PBKDF2 con sale).
+// Face ID / impronta usano WebAuthn: la chiave sta nel portachiavi del telefono.
+// ============================================================
+let APPENA_AUTENTICATO = false;      // accesso con password appena fatto: niente blocco subito
+const SBL_TENTATIVI = 5;
+const SBL_KEY = uid => "accessoRapido:" + uid;
+const b64u = buf => { const a = new Uint8Array(buf); let t = ""; for (let i = 0; i < a.length; i++) t += String.fromCharCode(a[i]); return btoa(t).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
+const b64uDec = x => { let t = x.replace(/-/g, "+").replace(/_/g, "/"); while (t.length % 4) t += "="; return Uint8Array.from(atob(t), c => c.charCodeAt(0)); };
+function leggiSblocco(uid) {
+  try { const v = JSON.parse(localStorage.getItem(SBL_KEY(uid)) || "null"); return v && (v.pin || v.bio) ? v : null; } catch (e) { return null; }
+}
+function scriviSblocco(uid, v) {
+  try { if (v && (v.pin || v.bio)) localStorage.setItem(SBL_KEY(uid), JSON.stringify(v)); else localStorage.removeItem(SBL_KEY(uid)); } catch (e) {}
+  try { window.dispatchEvent(new Event("accessoRapido")); } catch (e) {}
+}
+async function hashPin(pin, sale, iter) {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveBits"]);
+  return b64u(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: b64uDec(sale), iterations: iter }, k, 256));
+}
+async function biometriaDisponibile() {
+  try { return !!(window.PublicKeyCredential && window.isSecureContext && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()); } catch (e) { return false; }
+}
+function nomeBiometria() {
+  const ua = navigator.userAgent || "";
+  if (/iPhone|iPod/.test(ua)) return "Face ID";
+  if (/iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return "Face ID / Touch ID";
+  if (/Macintosh/.test(ua)) return "Touch ID";
+  if (/Android/.test(ua)) return "impronta o volto";
+  if (/Windows/.test(ua)) return "Windows Hello";
+  return "impronta o volto";
+}
+async function registraBiometria(utente) {
+  const cred = await navigator.credentials.create({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)),
+    rp: { name: "Contabilità " + ENTE },
+    user: { id: new TextEncoder().encode(utente.uid).slice(0, 64), name: utente.email || utente.nome || "utente", displayName: utente.nome || utente.email || "utente" },
+    pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+    authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required", residentKey: "discouraged" },
+    timeout: 60000, attestation: "none",
+  } });
+  return { credId: b64u(cred.rawId), creatoIl: new Date().toISOString() };
+}
+async function verificaBiometria(bio) {
+  const a = await navigator.credentials.get({ publicKey: {
+    challenge: crypto.getRandomValues(new Uint8Array(32)),
+    allowCredentials: [{ type: "public-key", id: b64uDec(bio.credId), transports: ["internal"] }],
+    userVerification: "required", timeout: 60000,
+  } });
+  const flag = new Uint8Array(a.response.authenticatorData)[32];
+  return b64u(a.rawId) === bio.credId && (flag & 0x04) !== 0;   // 0x04 = utente verificato (volto/impronta/codice del telefono)
+}
+const testoErroreBio = e => (e && e.name === "NotAllowedError") ? "Riconoscimento annullato o scaduto. Riprova, oppure usa il codice."
+  : (e && e.name === "InvalidStateError") ? "Su questo dispositivo è già attivo."
+  : "Riconoscimento non disponibile: " + ((e && e.message) || e);
+
+function SchermataBlocco({ utente, cfg, onSblocca, onEsci }) {
+  const [pin, setPin] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const bio = cfg && cfg.bio, haPin = cfg && cfg.pin;
+  const nomeBio = nomeBiometria();
+  const provaBio = async (auto) => {
+    setErr("");
+    try { if (await verificaBiometria(bio)) onSblocca(); else setErr("Riconoscimento non riuscito."); }
+    catch (e) { if (!auto) setErr(testoErroreBio(e)); }
+  };
+  // propongo subito il riconoscimento (se il telefono lo consente senza tocco)
+  useEffect(() => { if (bio) provaBio(true); }, []);
+  const provaPin = async (valore) => {
+    if (!haPin || busy || !valore) return;
+    setBusy(true); setErr("");
+    const ok = (await hashPin(valore, cfg.pin.sale, cfg.pin.iter)) === cfg.pin.hash;
+    const attuale = leggiSblocco(utente.uid) || cfg;
+    if (ok) { scriviSblocco(utente.uid, { ...attuale, tentativi: 0 }); onSblocca(); return; }
+    const t = (attuale.tentativi || 0) + 1;
+    if (t >= SBL_TENTATIVI) {
+      scriviSblocco(utente.uid, { ...attuale, pin: null, tentativi: 0 });
+      onEsci("Troppi codici sbagliati: entra con email e password. Poi scegli un nuovo codice da «Accesso rapido».");
+      return;
+    }
+    scriviSblocco(utente.uid, { ...attuale, tentativi: t });
+    setErr(`Codice sbagliato. ${SBL_TENTATIVI - t === 1 ? "Ancora 1 tentativo" : "Ancora " + (SBL_TENTATIVI - t) + " tentativi"}, poi servirà la password.`);
+    setPin(""); setBusy(false);
+  };
+  const cambia = v => {
+    const x = v.replace(/\D/g, "").slice(0, 8);
+    setPin(x);
+    if (haPin && cfg.pin.lunghezza && x.length === cfg.pin.lunghezza) provaPin(x);
+  };
+  return (
+    <div style={{position:"fixed", inset:0, zIndex:900, background:"var(--bg, #f6f4ef)", overflow:"auto"}}>
+      <div className="login-shell">
+        <form className="login-card" onSubmit={e => { e.preventDefault(); provaPin(pin); }}>
+          <div className="logo">{ENTE}</div>
+          <div className="tag">🔒 App bloccata · {utente.nome}</div>
+          {err && <div className="err">{err}</div>}
+          {bio && (
+            <button type="button" className="btn accent" style={{marginBottom: haPin ? 16 : 0}} onClick={() => provaBio(false)}>Sblocca con {nomeBio}</button>
+          )}
+          {haPin && (
+            <>
+              <div className="field">
+                <label>{bio ? "Oppure usa il codice" : "Codice"}</label>
+                <input type="password" inputMode="numeric" pattern="[0-9]*" autoComplete="off" autoFocus={!bio}
+                  value={pin} onChange={e => cambia(e.target.value)} disabled={busy}
+                  style={{fontSize:22, letterSpacing:"0.4em", textAlign:"center"}} aria-label="Codice di sblocco" />
+              </div>
+              <button className={"btn " + (bio ? "" : "accent")} type="submit" disabled={busy || !pin}>{busy ? "Controllo…" : "Sblocca"}</button>
+            </>
+          )}
+          <div style={{textAlign:"center", marginTop:14, fontSize:12.5}}>
+            <a href="#" onClick={e => { e.preventDefault(); onEsci(""); }}>Entra con email e password</a>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function PageAccessoRapido({ utente, onToast }) {
+  const [cfg, setCfg] = useState(() => leggiSblocco(utente.uid) || {});
+  const [bioOk, setBioOk] = useState(null);
+  const [pin1, setPin1] = useState("");
+  const [pin2, setPin2] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const nomeBio = nomeBiometria();
+  useEffect(() => { biometriaDisponibile().then(setBioOk); }, []);
+  const salva = (nuovo) => {
+    const v = { dopoMinuti: 5, ...nuovo, uid: utente.uid, nome: utente.nome, email: utente.email };
+    scriviSblocco(utente.uid, v);
+    setCfg(leggiSblocco(utente.uid) || {});
+    // la sessione deve restare sul dispositivo, altrimenti alla riapertura servirebbe di nuovo la password
+    try { firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(() => {}); } catch (e) {}
+  };
+  const impostaPin = async (e) => {
+    e.preventDefault(); setErr("");
+    if (!/^\d{4,8}$/.test(pin1)) { setErr("Il codice deve avere da 4 a 8 cifre."); return; }
+    if (pin1 !== pin2) { setErr("I due codici non coincidono."); return; }
+    if (/^(\d)\1+$/.test(pin1) || "01234567890".includes(pin1) || "09876543210".includes(pin1)) { setErr("Codice troppo facile (cifre tutte uguali o in fila): scegline un altro."); return; }
+    setBusy(true);
+    try {
+      const sale = b64u(crypto.getRandomValues(new Uint8Array(16))), iter = 150000;
+      const hash = await hashPin(pin1, sale, iter);
+      salva({ ...cfg, pin: { sale, iter, hash, lunghezza: pin1.length, impostatoIl: new Date().toISOString() }, tentativi: 0 });
+      setPin1(""); setPin2("");
+      onToast && onToast("Codice attivato su questo dispositivo");
+    } catch (er) { setErr("Non riesco a salvare il codice: " + (er.message || er)); }
+    setBusy(false);
+  };
+  const attivaBio = async () => {
+    setErr("");
+    try { const bio = await registraBiometria(utente); salva({ ...cfg, bio }); onToast && onToast(nomeBio + " attivato su questo dispositivo"); }
+    catch (er) { setErr(testoErroreBio(er)); }
+  };
+  const provaBio = async () => {
+    setErr("");
+    try { onToast && onToast((await verificaBiometria(cfg.bio)) ? nomeBio + ": riconosciuto ✓" : "Riconoscimento non riuscito", "success"); }
+    catch (er) { setErr(testoErroreBio(er)); }
+  };
+  const togli = (campo) => { salva({ ...cfg, [campo]: null }); onToast && onToast(campo === "pin" ? "Codice tolto" : nomeBio + " tolto"); };
+  const attivo = !!(cfg.pin || cfg.bio);
+  const riga = {display:"flex", alignItems:"center", justifyContent:"space-between", gap:12, flexWrap:"wrap"};
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <h2>Accesso rapido</h2>
+          <div className="sub">Entra con un codice o con {nomeBio}, senza riscrivere email e password · solo su questo dispositivo</div>
+        </div>
+      </div>
+      {err && <div className="card" style={{padding:12, marginBottom:12, color:"var(--danger)"}}>{err}</div>}
+
+      <div className="card" style={{padding:16, marginBottom:12}}>
+        <div style={riga}>
+          <div>
+            <div style={{fontWeight:600}}>{nomeBio.charAt(0).toUpperCase() + nomeBio.slice(1)}</div>
+            <div style={{fontSize:12.5, color:"var(--ink-2)", marginTop:2}}>
+              {cfg.bio ? "Attivo su questo dispositivo." : bioOk === false ? "Questo dispositivo o browser non lo consente. Puoi usare il codice." : "Usa il riconoscimento del telefono per aprire l'app."}
+            </div>
+          </div>
+          <div style={{display:"flex", gap:8}}>
+            {cfg.bio && <button className="btn" onClick={provaBio}>Prova</button>}
+            {cfg.bio && <button className="btn ghost" onClick={() => togli("bio")}>Togli</button>}
+            {!cfg.bio && <button className="btn accent" onClick={attivaBio} disabled={bioOk !== true}>Attiva {nomeBio}</button>}
+          </div>
+        </div>
+      </div>
+
+      <div className="card" style={{padding:16, marginBottom:12}}>
+        <div style={riga}>
+          <div>
+            <div style={{fontWeight:600}}>Codice</div>
+            <div style={{fontSize:12.5, color:"var(--ink-2)", marginTop:2}}>
+              {cfg.pin ? `Attivo (${cfg.pin.lunghezza} cifre). Puoi cambiarlo qui sotto.` : "Da 4 a 8 cifre. Serve anche come alternativa se il riconoscimento non va."}
+            </div>
+          </div>
+          {cfg.pin && <button className="btn ghost" onClick={() => togli("pin")}>Togli</button>}
+        </div>
+        <form onSubmit={impostaPin} style={{display:"flex", gap:8, flexWrap:"wrap", alignItems:"flex-end", marginTop:12}}>
+          <div style={{display:"flex", flexDirection:"column", gap:4}}>
+            <label style={{fontSize:11.5, color:"var(--ink-2)", fontWeight:500}}>{cfg.pin ? "Nuovo codice" : "Codice"}</label>
+            <input type="password" inputMode="numeric" pattern="[0-9]*" autoComplete="new-password" maxLength={8} value={pin1} onChange={e => setPin1(e.target.value.replace(/\D/g, ""))} style={{width:140}} />
+          </div>
+          <div style={{display:"flex", flexDirection:"column", gap:4}}>
+            <label style={{fontSize:11.5, color:"var(--ink-2)", fontWeight:500}}>Ripeti</label>
+            <input type="password" inputMode="numeric" pattern="[0-9]*" autoComplete="new-password" maxLength={8} value={pin2} onChange={e => setPin2(e.target.value.replace(/\D/g, ""))} style={{width:140}} />
+          </div>
+          <button className="btn accent" type="submit" disabled={busy || !pin1}>{busy ? "Salvo…" : (cfg.pin ? "Cambia codice" : "Attiva codice")}</button>
+        </form>
+      </div>
+
+      <div className="card" style={{padding:16, marginBottom:12}}>
+        <div style={riga}>
+          <div>
+            <div style={{fontWeight:600}}>Blocca l'app</div>
+            <div style={{fontSize:12.5, color:"var(--ink-2)", marginTop:2}}>Sempre all'apertura. In più, quando torni sull'app dopo:</div>
+          </div>
+          <select value={cfg.dopoMinuti ?? 5} disabled={!attivo} onChange={e => salva({ ...cfg, dopoMinuti: Number(e.target.value) })} style={{width:"auto"}}>
+            <option value={0}>subito</option>
+            <option value={1}>1 minuto</option>
+            <option value={5}>5 minuti</option>
+            <option value={15}>15 minuti</option>
+            <option value={60}>1 ora</option>
+            <option value={-1}>solo alla riapertura</option>
+          </select>
+        </div>
+        {attivo && <div style={{fontSize:12.5, color:"var(--ink-2)", marginTop:10}}>Puoi bloccarla anche a mano con il lucchetto 🔒 in alto.</div>}
+      </div>
+
+      <div style={{fontSize:12.5, lineHeight:1.6, color:"var(--ink-3)", maxWidth:680}}>
+        Vale solo su questo dispositivo: sugli altri si entra come sempre. Email e password servono la prima volta, dopo «Esci» e dopo {SBL_TENTATIVI} codici sbagliati.
+        Il codice non viene salvato in chiaro e {nomeBio} resta nel telefono: l'app non vede mai il tuo volto o la tua impronta.
+      </div>
+    </div>
+  );
+}
+
 function Login({ adminCreato, messaggio }) {
   const [email, setEmail] = useState("");
   const [pw, setPw] = useState("");
@@ -1558,8 +1803,9 @@ function Login({ adminCreato, messaggio }) {
     e.preventDefault(); setErr(""); setInfo(""); setBusy(true);
     try {
       await firebase.auth().setPersistence(ricorda ? firebase.auth.Auth.Persistence.LOCAL : firebase.auth.Auth.Persistence.SESSION);
+      APPENA_AUTENTICATO = true;
       await firebase.auth().signInWithEmailAndPassword(email.trim(), pw);
-    } catch (er) { setErr(testoErroreAuth(er)); setBusy(false); }
+    } catch (er) { APPENA_AUTENTICATO = false; setErr(testoErroreAuth(er)); setBusy(false); }
   };
   const creaAdmin = async (e) => {
     e.preventDefault(); setErr(""); setInfo("");
@@ -1569,6 +1815,7 @@ function Login({ adminCreato, messaggio }) {
     setBusy(true);
     try {
       await firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+      APPENA_AUTENTICATO = true;
       const cred = await firebase.auth().createUserWithEmailAndPassword(email.trim(), pw);
       const uid = cred.user.uid;
       // utente admin + segnale "amministratore creato", nella stessa scrittura
@@ -1713,6 +1960,39 @@ function Root() {
 function RootContenuto() {
   const [stato, setStato] = useState({ fase: "carico" });
   const [adminCreato, setAdminCreato] = useState(null);
+  const [bloccato, setBloccato] = useState(false);
+  const [cfgSbl, setCfgSbl] = useState(null);
+  const appRef = useRef(null);
+  const uidApp = stato.fase === "app" && stato.utente ? stato.utente.uid : null;
+  // accesso rapido: blocco all'apertura e quando si torna sull'app dopo un po'
+  React.useLayoutEffect(() => {
+    if (!uidApp) { setCfgSbl(null); setBloccato(false); return; }
+    const c = leggiSblocco(uidApp);
+    setCfgSbl(c);
+    setBloccato(!!c && !APPENA_AUTENTICATO);
+    APPENA_AUTENTICATO = false;
+    const rileggi = () => setCfgSbl(leggiSblocco(uidApp));
+    let via = null;
+    const vis = () => {
+      if (document.visibilityState === "hidden") { via = Date.now(); return; }
+      if (via === null) return;
+      const x = leggiSblocco(uidApp), min = x ? (x.dopoMinuti ?? 5) : -1;
+      if (x && min >= 0 && Date.now() - via >= min * 60000) setBloccato(true);
+      via = null;
+    };
+    window.addEventListener("accessoRapido", rileggi);
+    document.addEventListener("visibilitychange", vis);
+    return () => { window.removeEventListener("accessoRapido", rileggi); document.removeEventListener("visibilitychange", vis); };
+  }, [uidApp]);
+  const bloccoAttivo = !!(bloccato && cfgSbl);
+  useEffect(() => {
+    const el = appRef.current; if (!el) return;
+    if (bloccoAttivo) el.setAttribute("inert", ""); else el.removeAttribute("inert");
+  }, [bloccoAttivo, uidApp]);
+  const esci = (msg) => {
+    setStato(s => ({ ...s, messaggioUscita: msg || "" }));
+    firebase.auth().signOut().catch(() => {});
+  };
   useEffect(() => {
     if (!firebaseReady) { setStato({ fase: "app", utente: null }); return; }
     const pubRef = db.ref("pubblico/adminCreato");
@@ -1763,7 +2043,14 @@ function RootContenuto() {
     );
   }
   if (stato.fase === "login") return <Login key={"login" + (stato.n || 0)} adminCreato={adminCreato} messaggio={stato.messaggio} />;
-  return <App utente={stato.utente} />;
+  return (
+    <>
+      <div ref={appRef} style={{display:"contents"}} aria-hidden={bloccoAttivo ? "true" : undefined}>
+        <App utente={stato.utente} onBlocca={cfgSbl ? () => setBloccato(true) : null} />
+      </div>
+      {bloccoAttivo && <SchermataBlocco utente={stato.utente} cfg={cfgSbl} onSblocca={() => setBloccato(false)} onEsci={esci} />}
+    </>
+  );
 }
 
 // ============================================================
@@ -20367,7 +20654,7 @@ function PageAnalisi({ stagione, stagioniDisponibili, conti, movimenti, cespiti,
   );
 }
 
-function App({ utente }) {
+function App({ utente, onBlocca }) {
   // La stagione attiva viene ricordata sul dispositivo. Se non c'e' una scelta
   // salvata, si parte da quella suggerita dalla data, ma NON si salta mai da soli
   // a una stagione che su Firebase non esiste ancora: al 1 gennaio l'esercizio
@@ -20664,6 +20951,7 @@ function App({ utente }) {
         <button className="icon-btn" onClick={() => setPannelloStagioni(true)} title="Mostra tutte le stagioni presenti su Firebase">Stagioni</button>
         <button className="icon-btn desktop-only" onClick={newStagione}>+ Nuovo esercizio</button>
         {utente && <span className="chi" title={utente.email}>👤 {utente.nome} <span className="ruolo desktop-only">· {RUOLI[utente.ruolo] || utente.ruolo}</span></span>}
+        {onBlocca && <button className="icon-btn" onClick={onBlocca} title="Blocca l'app (si riapre con il codice o il riconoscimento)" aria-label="Blocca l'app">🔒</button>}
         <button className="icon-btn" onClick={() => { if (firebase.auth) firebase.auth().signOut(); }}>Esci</button>
       </div>
 
@@ -20707,6 +20995,12 @@ function App({ utente }) {
           <button className={"navlink " + (page==="crediti"?"active":"")} onClick={() => setPage("crediti")}><span className="ico">🧾</span> Crediti</button>
           <button className={"navlink " + (page==="ammortamenti"?"active":"")} onClick={() => setPage("ammortamenti")}><span className="ico">⊟</span> Ammortamenti</button>
           <button className={"navlink " + (page==="cassa"?"active":"")} onClick={() => setPage("cassa")}><span className="ico">💵</span> Composizione Cassa</button>
+          {utente && (
+            <>
+              <div className="section-label">Il mio accesso</div>
+              <button className={"navlink " + (page==="accesso"?"active":"")} onClick={() => setPage("accesso")}><span className="ico">🔐</span> Accesso rapido</button>
+            </>
+          )}
           {utente && utente.ruolo === "admin" && (
             <>
               <div className="section-label">Amministrazione</div>
@@ -20767,6 +21061,7 @@ function App({ utente }) {
               {page === "controller" && <PageController conti={conti} movimenti={movimenti} saldiIniziali={saldiInizialiEff} stagione={stagione} onToast={showToast} onApri={setPage} />}
               {page === "budget" && <PageBudget conti={conti} movimenti={movimenti} saldiIniziali={saldiInizialiEff} bu={bu} stagione={stagione} onToast={showToast} />}
               {page === "snapshot" && <PageSnapshot conti={conti} movimenti={movimenti} saldiIniziali={saldiInizialiEff} stagione={stagione} onToast={showToast} />}
+              {page === "accesso" && utente && <PageAccessoRapido utente={utente} onToast={showToast} />}
               {page === "utenti" && utente && utente.ruolo === "admin" && <PageUtenti onToast={showToast} />}
               {page === "registro" && utente && utente.ruolo === "admin" && <PageRegistro movimenti={movimenti} stagione={stagione} />}
               {utente && utente.ruolo === "lettura" && page === "nuovo" && <div className="card" style={{padding:14, marginBottom:12}}>Il tuo utente è in <b>sola lettura</b>: puoi consultare i dati ma non registrare movimenti.</div>}
