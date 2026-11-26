@@ -1070,8 +1070,8 @@ const APP_VERSION = "1.0.0";
 const ENTE = "Pro Loco Fabbrico APS";
 const ENTE_UP = ENTE.toUpperCase();
 try { document.title = "Contabilità · " + ENTE; } catch (e) {}
-const APP_PASSWORD = "proloco26"; // password di accesso all'app
-const SESSION_KEY = "proloco_contab_session";
+// Accesso: ogni persona ha il proprio utente (email + password, Firebase Auth).
+// Gli utenti abilitati e il loro ruolo stanno in utenti/<uid> (vedi Root e PageUtenti).
 
 // Config Firebase: progetto "contproloco" dedicato alla Pro Loco
 // (separato da quello del futsal, cosi' i dati non si mescolano).
@@ -1130,24 +1130,95 @@ function _verificaScrittura(stag, valore) {
   }
 }
 
+// ============================================================
+// UTENTE CORRENTE, PERMESSI E REGISTRO ATTIVITA'
+// UTENTE = { uid, nome, email, ruolo: "admin" | "operatore" | "lettura" }
+// Ogni scrittura nel database (set / update / push / remove) passa da qui:
+//  - chi e' in sola lettura viene fermato;
+//  - dopo la scrittura si aggiunge una riga in registro/<id> con chi, quando,
+//    cosa e il valore prima e dopo. Il registro si puo' solo aggiungere.
+// Le stesse regole valgono anche sul server (regole del database, vedi PageUtenti).
+// ============================================================
+let UTENTE = null;
+const RUOLI = { admin: "Amministratore", operatore: "Operatore", lettura: "Sola lettura" };
+const isAdmin = () => !!UTENTE && UTENTE.ruolo === "admin";
+const REGISTRO_MAX_CHAR = 30000;   // oltre, nel registro resta solo la dimensione
+
+function _perRegistro(v, percorso) {
+  if (v === undefined || v === null) return null;
+  let x = v;
+  // dagli allegati tengo i dati descrittivi, non il file
+  if (/^allegati(\/|$)/.test(percorso) && typeof v === "object") {
+    const togli = o => (o && typeof o === "object") ? Object.fromEntries(Object.entries(o).filter(([k]) => k !== "dati").map(([k, w]) => [k, (w && typeof w === "object") ? togli(w) : w])) : o;
+    x = togli(v);
+  }
+  let t;
+  try { t = JSON.stringify(x); } catch (e) { return { _nonLeggibile: true }; }
+  if (t === undefined) return null;
+  if (t.length > REGISTRO_MAX_CHAR) return { _omesso: true, caratteri: t.length };
+  return JSON.parse(t);
+}
+
+function _registra(rawRef, azione, percorso, prima, dopo) {
+  if (/^registro(\/|$)/.test(percorso)) return;
+  const u = UTENTE || (firebase.auth && firebase.auth().currentUser ? { uid: firebase.auth().currentUser.uid, nome: firebase.auth().currentUser.email || "", email: firebase.auth().currentUser.email || "", ruolo: "" } : null);
+  if (!u) return;
+  const riga = {
+    quando: new Date().toISOString(), uid: u.uid, nome: u.nome || "", email: u.email || "", ruolo: u.ruolo || "",
+    azione, percorso: percorso || "/", prima: _perRegistro(prima, percorso), dopo: _perRegistro(dopo, percorso),
+  };
+  try { rawRef("registro").push(riga).catch(e => console.warn("Registro attività non scritto:", e && e.message)); }
+  catch (e) { console.warn("Registro attività non scritto:", e && e.message); }
+}
+
+function _controllaPermesso(percorso) {
+  if (/^registro(\/|$)/.test(percorso)) return;
+  if (UTENTE && UTENTE.ruolo === "lettura") {
+    throw new Error("Il tuo utente è in sola lettura: non può modificare i dati. Chiedi all'amministratore.");
+  }
+}
+
 if (db) {
   const _ref = db.ref.bind(db);
-  const avvolgi = (ref, stag) => {
-    const set0 = ref.set.bind(ref), upd0 = ref.update.bind(ref), push0 = ref.push.bind(ref), child0 = ref.child.bind(ref);
-    ref.set = (v, ...a) => { _verificaScrittura(stag, v); return set0(v, ...a); };
-    ref.update = (v, ...a) => { _verificaScrittura(stag, v); return upd0(v, ...a); };
-    ref.push = (v, ...a) => {
-      if (v !== undefined) _verificaScrittura(stag, v);
-      const p = push0(v, ...a);
-      return (p && typeof p.set === "function") ? avvolgi(p, stag) : p;
+  const unisci = (a, b) => [a, b].filter(Boolean).join("/").replace(/\/+/g, "/").replace(/^\/|\/$/g, "");
+  const avvolgi = (ref, percorso) => {
+    const raw = { set: ref.set.bind(ref), update: ref.update.bind(ref), remove: ref.remove.bind(ref), push: ref.push.bind(ref), child: ref.child.bind(ref) };
+    const mm = percorso.match(/^stagioni\/([^/]+)\/movimenti(\/|$)/);
+    const verificaMov = (v) => { if (mm) _verificaScrittura(mm[1], v); };
+    const leggi = (pp) => (/^allegati(\/|$)/.test(pp) ? Promise.resolve(null) : _ref(pp).once("value").then(sn => sn.val()).catch(() => null));
+    ref.set = (v, ...a) => {
+      _controllaPermesso(percorso); verificaMov(v);
+      return leggi(percorso).then(prima => raw.set(v, ...a).then(r => {
+        _registra(_ref, prima == null ? "crea" : (v == null ? "cancella" : "modifica"), percorso, prima, v); return r; }));
     };
-    ref.child = (p, ...a) => avvolgi(child0(p, ...a), stag);
+    ref.update = (v, ...a) => {
+      _controllaPermesso(percorso); verificaMov(v);
+      const chiavi = v && typeof v === "object" ? Object.keys(v) : [];
+      const primaP = chiavi.length <= 40
+        ? Promise.all(chiavi.map(k => leggi(unisci(percorso, k)).then(x => [k, x]))).then(arr => Object.fromEntries(arr.filter(([, x]) => x !== null)))
+        : Promise.resolve({ _omesso: true, chiavi: chiavi.length });
+      return primaP.then(prima => raw.update(v, ...a).then(r => { _registra(_ref, "aggiorna", percorso, prima, v); return r; }));
+    };
+    ref.remove = (...a) => {
+      _controllaPermesso(percorso);
+      return leggi(percorso).then(prima => raw.remove(...a).then(r => { _registra(_ref, "cancella", percorso, prima, null); return r; }));
+    };
+    ref.push = (v, ...a) => {
+      _controllaPermesso(percorso);
+      if (v !== undefined) verificaMov(v);
+      const figlio = raw.push();
+      const w = avvolgi(figlio, unisci(percorso, figlio.key));
+      if (v === undefined) return w;
+      const pr = w.set(v, ...a).then(() => w);
+      w.then = pr.then.bind(pr); w.catch = pr.catch.bind(pr);
+      return w;
+    };
+    ref.child = (c, ...a) => avvolgi(raw.child(c, ...a), unisci(percorso, String(c)));
     return ref;
   };
   db.ref = function (path) {
     const r = _ref(path);
-    const m = typeof path === "string" && path.match(/^stagioni\/([^/]+)\/movimenti(\/|$)/);
-    return m ? avvolgi(r, m[1]) : r;
+    return avvolgi(r, unisci(typeof path === "string" ? path : "", ""));
   };
 }
 
@@ -1429,41 +1500,495 @@ function useFirebaseData(stagione) {
 // ============================================================
 // LOGIN
 // ============================================================
-function Login({ onLogin }) {
+// ============================================================
+// ACCESSO CON UTENTE PERSONALE
+// ============================================================
+const ERRORI_AUTH = {
+  "auth/invalid-email": "L'indirizzo email non è valido.",
+  "auth/user-disabled": "Questo utente è stato disattivato.",
+  "auth/user-not-found": "Email o password errate.",
+  "auth/wrong-password": "Email o password errate.",
+  "auth/invalid-credential": "Email o password errate.",
+  "auth/invalid-login-credentials": "Email o password errate.",
+  "auth/too-many-requests": "Troppi tentativi: riprova tra qualche minuto.",
+  "auth/email-already-in-use": "Esiste già un utente con questa email.",
+  "auth/weak-password": "La password deve avere almeno 6 caratteri.",
+  "auth/operation-not-allowed": "L'accesso con email e password non è attivo nel progetto Firebase (Authentication → Sign-in method → Email/Password).",
+  "auth/network-request-failed": "Connessione assente: controlla la rete e riprova.",
+};
+const testoErroreAuth = (e) => ERRORI_AUTH[e && e.code] || ((e && e.message) || "Operazione non riuscita.");
+
+function Login({ adminCreato, messaggio }) {
+  const [email, setEmail] = useState("");
   const [pw, setPw] = useState("");
-  const [err, setErr] = useState("");
+  const [nome, setNome] = useState("");
+  const [pw2, setPw2] = useState("");
   const [ricorda, setRicorda] = useState(true);
-  const submit = (e) => {
-    e.preventDefault();
-    if (pw === APP_PASSWORD) {
-      sessionStorage.setItem(SESSION_KEY, "1");
-      try { if (ricorda) localStorage.setItem(SESSION_KEY, "1"); else localStorage.removeItem(SESSION_KEY); } catch (er) {}
-      onLogin();
-    } else {
-      setErr("Password errata.");
-    }
+  const [err, setErr] = useState(messaggio || "");
+  const [info, setInfo] = useState("");
+  const [busy, setBusy] = useState(false);
+  const primoAvvio = adminCreato === false;
+  // messaggio da Root (utente disattivato / non abilitato): lo mostro e sblocco il pulsante
+  useEffect(() => { if (messaggio) { setErr(messaggio); setInfo(""); setBusy(false); } }, [messaggio]);
+
+  const entra = async (e) => {
+    e.preventDefault(); setErr(""); setInfo(""); setBusy(true);
+    try {
+      await firebase.auth().setPersistence(ricorda ? firebase.auth.Auth.Persistence.LOCAL : firebase.auth.Auth.Persistence.SESSION);
+      await firebase.auth().signInWithEmailAndPassword(email.trim(), pw);
+    } catch (er) { setErr(testoErroreAuth(er)); setBusy(false); }
   };
+  const creaAdmin = async (e) => {
+    e.preventDefault(); setErr(""); setInfo("");
+    if (!nome.trim()) { setErr("Scrivi il tuo nome."); return; }
+    if (pw.length < 8) { setErr("Scegli una password di almeno 8 caratteri."); return; }
+    if (pw !== pw2) { setErr("Le due password non coincidono."); return; }
+    setBusy(true);
+    try {
+      await firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+      const cred = await firebase.auth().createUserWithEmailAndPassword(email.trim(), pw);
+      const uid = cred.user.uid;
+      // utente admin + segnale "amministratore creato", nella stessa scrittura
+      await db.ref().update({
+        [`utenti/${uid}`]: { nome: nome.trim(), email: email.trim().toLowerCase(), ruolo: "admin", attivo: true, creatoIl: new Date().toISOString(), creatoDa: "primo accesso" },
+        "pubblico/adminCreato": true,
+      });
+      // Root se ne accorge da solo (ascolta utenti/<uid>)
+    } catch (er) { setErr(testoErroreAuth(er)); setBusy(false); }
+  };
+  const dimenticata = async () => {
+    setErr(""); setInfo("");
+    if (!email.trim()) { setErr("Scrivi prima la tua email qui sopra."); return; }
+    try { await firebase.auth().sendPasswordResetEmail(email.trim()); setInfo("Ti ho mandato un'email con il link per scegliere una nuova password."); }
+    catch (er) { setErr(testoErroreAuth(er)); }
+  };
+
   return (
     <div className="login-shell">
-      <form className="login-card" onSubmit={submit}>
+      <form className="login-card" onSubmit={primoAvvio ? creaAdmin : entra}>
         <div className="logo">{ENTE}</div>
-        <div className="tag">Contabilità · Esercizio {STAGIONE_DEFAULT}</div>
+        <div className="tag">{primoAvvio ? "Primo accesso · crea l'amministratore" : "Contabilità · accesso"}</div>
+        {primoAvvio && (
+          <div style={{fontSize:12.5, lineHeight:1.5, color:"var(--ink-2)", margin:"-6px 0 14px"}}>
+            Nessun utente è ancora stato creato. Il primo account diventa <b>amministratore</b>: potrà creare gli altri utenti e vedere il registro delle attività.
+          </div>
+        )}
         {err && <div className="err">{err}</div>}
+        {info && <div className="err" style={{background:"var(--accent-soft, #e6f2ea)", color:"var(--ink)", borderColor:"transparent"}}>{info}</div>}
+        {primoAvvio && (
+          <div className="field">
+            <label>Nome e cognome</label>
+            <input type="text" autoFocus value={nome} onChange={e => setNome(e.target.value)} autoComplete="name" />
+          </div>
+        )}
+        <div className="field">
+          <label>Email</label>
+          <input type="email" autoFocus={!primoAvvio} value={email} onChange={e => setEmail(e.target.value)} autoComplete="username" />
+        </div>
         <div className="field">
           <label>Password</label>
-          <input type="password" autoFocus value={pw} onChange={e => setPw(e.target.value)} />
+          <input type="password" value={pw} onChange={e => setPw(e.target.value)} autoComplete={primoAvvio ? "new-password" : "current-password"} />
         </div>
-        <label style={{display:"flex", alignItems:"center", gap:8, fontSize:12.5, margin:"-4px 0 14px", color:"var(--ink-2)", cursor:"pointer"}}>
-          <input type="checkbox" style={{width:"auto"}} checked={ricorda} onChange={e => setRicorda(e.target.checked)} />
-          Resta connesso su questo dispositivo
-        </label>
-        <button className="btn accent" type="submit">Entra</button>
+        {primoAvvio ? (
+          <div className="field">
+            <label>Ripeti la password</label>
+            <input type="password" value={pw2} onChange={e => setPw2(e.target.value)} autoComplete="new-password" />
+          </div>
+        ) : (
+          <label style={{display:"flex", alignItems:"center", gap:8, fontSize:12.5, margin:"-4px 0 14px", color:"var(--ink-2)", cursor:"pointer"}}>
+            <input type="checkbox" style={{width:"auto"}} checked={ricorda} onChange={e => setRicorda(e.target.checked)} />
+            Resta connesso su questo dispositivo
+          </label>
+        )}
+        <button className="btn accent" type="submit" disabled={busy}>{busy ? "Attendi…" : (primoAvvio ? "Crea amministratore ed entra" : "Entra")}</button>
+        {!primoAvvio && (
+          <div style={{textAlign:"center", marginTop:12, fontSize:12.5}}>
+            <a href="#" onClick={e => { e.preventDefault(); dimenticata(); }}>Password dimenticata?</a>
+          </div>
+        )}
         {!firebaseReady && (
           <div style={{marginTop:18, fontSize:11.5, color:"var(--warn)", lineHeight:1.5}}>
             ⚠ Firebase non configurato. Apri <span className="mono">index.html</span> e incolla la config nel blocco <span className="mono">FIREBASE_CONFIG</span>.
           </div>
         )}
       </form>
+    </div>
+  );
+}
+
+// Decide cosa mostrare: accesso, utente non autorizzato, oppure l'app.
+function Root() {
+  const [stato, setStato] = useState({ fase: "carico" });
+  const [adminCreato, setAdminCreato] = useState(null);
+  useEffect(() => {
+    if (!firebaseReady) { setStato({ fase: "app", utente: null }); return; }
+    const pubRef = db.ref("pubblico/adminCreato");
+    const cbPub = pubRef.on("value", sn => setAdminCreato(sn.val() === true), () => setAdminCreato(true));
+    let refUtente = null, cbUtente = null;
+    const stacca = () => { if (refUtente && cbUtente) refUtente.off("value", cbUtente); refUtente = null; cbUtente = null; };
+    const unsub = firebase.auth().onAuthStateChanged(user => {
+      stacca();
+      if (!user || user.isAnonymous) {
+        UTENTE = null;
+        if (user && user.isAnonymous) firebase.auth().signOut().catch(() => {});
+        setStato(s => ({ fase: "login", messaggio: s.messaggioUscita || "", n: (s.n || 0) + 1 }));
+        return;
+      }
+      setStato({ fase: "carico" });
+      refUtente = db.ref(`utenti/${user.uid}`);
+      cbUtente = refUtente.on("value", sn => {
+        const u = sn.val();
+        if (!u) { UTENTE = null; setStato({ fase: "attesa", email: user.email }); return; }   // appena creato: aspetto il record
+        if (u.attivo !== true) {
+          UTENTE = null;
+          setStato({ fase: "login", messaggioUscita: "Il tuo utente è disattivato. Chiedi all'amministratore.", messaggio: "Il tuo utente è disattivato. Chiedi all'amministratore." });
+          firebase.auth().signOut().catch(() => {});
+          return;
+        }
+        UTENTE = { uid: user.uid, nome: u.nome || user.email, email: u.email || user.email, ruolo: u.ruolo || "lettura" };
+        setStato({ fase: "app", utente: { ...UTENTE } });
+      }, () => {
+        UTENTE = null;
+        setStato({ fase: "login", messaggio: "Questo utente non è abilitato alla contabilità. Chiedi all'amministratore." });
+        firebase.auth().signOut().catch(() => {});
+      });
+    });
+    return () => { unsub(); stacca(); pubRef.off("value", cbPub); };
+  }, []);
+
+  if (stato.fase === "carico" || (stato.fase === "login" && adminCreato === null)) {
+    return <div className="login-shell"><div className="login-card"><div className="logo">{ENTE}</div><div className="tag">Caricamento…</div></div></div>;
+  }
+  if (stato.fase === "attesa") {
+    return (
+      <div className="login-shell"><div className="login-card">
+        <div className="logo">{ENTE}</div>
+        <div className="tag">Utente non abilitato</div>
+        <p style={{fontSize:13, lineHeight:1.6, color:"var(--ink-2)"}}>L'account <b>{stato.email}</b> non è tra gli utenti della contabilità. Chiedi all'amministratore di crearlo.</p>
+        <button className="btn" style={{width:"100%", justifyContent:"center"}} onClick={() => firebase.auth().signOut()}>Esci</button>
+      </div></div>
+    );
+  }
+  if (stato.fase === "login") return <Login key={"login" + (stato.n || 0)} adminCreato={adminCreato} messaggio={stato.messaggio} />;
+  return <App utente={stato.utente} />;
+}
+
+// ============================================================
+// AMMINISTRAZIONE: UTENTI
+// ============================================================
+function generaPassword(n = 12) {
+  const c = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const r = crypto.getRandomValues(new Uint32Array(n));
+  return Array.from(r, x => c[x % c.length]).join("");
+}
+
+const REGOLE_DATABASE = (() => {
+  const attivo = "auth != null && root.child('utenti').child(auth.uid).child('attivo').val() === true";
+  const admin = attivo + " && root.child('utenti').child(auth.uid).child('ruolo').val() === 'admin'";
+  const scrive = attivo + " && root.child('utenti').child(auth.uid).child('ruolo').val() !== 'lettura'";
+  return JSON.stringify({
+    rules: {
+      pubblico: { ".read": true, adminCreato: { ".write": "auth != null && !data.exists() && newData.val() === true" } },
+      utenti: {
+        ".read": attivo,
+        "$uid": {
+          ".read": "auth != null && auth.uid === $uid",
+          ".write": "(" + admin + ") || (auth != null && auth.uid === $uid && !root.child('pubblico/adminCreato').exists() && newData.child('ruolo').val() === 'admin')",
+        },
+      },
+      registro: {
+        ".read": admin,
+        "$id": { ".write": attivo + " && !data.exists() && newData.child('uid').val() === auth.uid" },
+      },
+      "$altro": { ".read": attivo, ".write": scrive },
+    },
+  }, null, 2);
+})();
+
+function PageUtenti({ onToast }) {
+  const [utenti, setUtenti] = useState([]);
+  const [nuovo, setNuovo] = useState(null);       // { nome, email, password, ruolo }
+  const [creato, setCreato] = useState(null);     // credenziali da comunicare
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [mostraRegole, setMostraRegole] = useState(false);
+  useEffect(() => {
+    const ref = db.ref("utenti");
+    const cb = ref.on("value", sn => {
+      const v = sn.val() || {};
+      setUtenti(Object.entries(v).map(([uid, u]) => ({ uid, ...u })).sort((a, b) => (a.nome || "").localeCompare(b.nome || "", "it")));
+    }, () => {});
+    return () => ref.off("value", cb);
+  }, []);
+  const adminAttivi = utenti.filter(u => u.ruolo === "admin" && u.attivo === true);
+  const copia = (t, cosa) => { try { navigator.clipboard.writeText(t); onToast && onToast(cosa + " copiat" + (cosa.endsWith("e") ? "e" : "o")); } catch (e) {} };
+
+  const crea = async (e) => {
+    e.preventDefault(); setErr("");
+    const nome = (nuovo.nome || "").trim(), email = (nuovo.email || "").trim().toLowerCase(), password = nuovo.password || "";
+    if (!nome) { setErr("Scrivi il nome."); return; }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { setErr("L'email non è valida."); return; }
+    if (password.length < 8) { setErr("La password iniziale deve avere almeno 8 caratteri."); return; }
+    setBusy(true);
+    try {
+      // l'utente si crea con una seconda istanza di Firebase: chi la crea resta collegato
+      const sec = firebase.apps.find(a => a.name === "gestioneUtenti") || firebase.initializeApp(FIREBASE_CONFIG, "gestioneUtenti");
+      await sec.auth().setPersistence(firebase.auth.Auth.Persistence.NONE);
+      const cred = await sec.auth().createUserWithEmailAndPassword(email, password);
+      const uid = cred.user.uid;
+      await sec.auth().signOut();
+      await db.ref(`utenti/${uid}`).set({ nome, email, ruolo: nuovo.ruolo, attivo: true, creatoIl: new Date().toISOString(), creatoDa: UTENTE ? UTENTE.nome : "" });
+      setCreato({ nome, email, password, ruolo: nuovo.ruolo });
+      setNuovo(null);
+      onToast && onToast("Utente creato");
+    } catch (er) { setErr(testoErroreAuth(er)); }
+    setBusy(false);
+  };
+  const cambia = async (u, patch, msg) => {
+    if (u.uid === (UTENTE && UTENTE.uid) && ((patch.ruolo && patch.ruolo !== "admin") || patch.attivo === false) && adminAttivi.length <= 1) {
+      alert("Sei l'unico amministratore attivo: prima nomina un altro amministratore."); return;
+    }
+    try { await db.ref(`utenti/${u.uid}`).update({ ...patch, modificatoIl: new Date().toISOString(), modificatoDa: UTENTE ? UTENTE.nome : "" }); onToast && onToast(msg); }
+    catch (er) { alert("Errore: " + er.message); }
+  };
+  const reset = async (u) => {
+    try { await firebase.auth().sendPasswordResetEmail(u.email); onToast && onToast("Email per la nuova password inviata a " + u.email); }
+    catch (er) { alert(testoErroreAuth(er)); }
+  };
+
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <h2>Utenti</h2>
+          <div className="sub">Chi può entrare nella contabilità e cosa può fare</div>
+        </div>
+        {!nuovo && <button className="btn accent" onClick={() => { setCreato(null); setErr(""); setNuovo({ nome: "", email: "", password: generaPassword(), ruolo: "operatore" }); }}>+ Nuovo utente</button>}
+      </div>
+
+      <div className="card" style={{padding:"12px 16px", fontSize:13, lineHeight:1.6, color:"var(--ink-2)", marginBottom:16}}>
+        <b>Amministratore</b>: tutto, più utenti e registro attività · <b>Operatore</b>: registra e modifica i movimenti e le anagrafiche · <b>Sola lettura</b>: consulta e scarica, non modifica.
+      </div>
+
+      {creato && (
+        <div className="card" style={{padding:16, marginBottom:16, borderLeft:"4px solid var(--accent)"}}>
+          <div style={{fontWeight:600, marginBottom:8}}>Utente creato: comunica a {creato.nome} queste credenziali</div>
+          <div className="mono" style={{fontSize:13, lineHeight:1.8}}>
+            Indirizzo: {location.origin + location.pathname}<br />
+            Email: {creato.email}<br />
+            Password iniziale: {creato.password}
+          </div>
+          <div style={{display:"flex", gap:8, marginTop:10, flexWrap:"wrap"}}>
+            <button className="btn sm" onClick={() => copia(`Contabilità ${ENTE}\n${location.origin + location.pathname}\nEmail: ${creato.email}\nPassword iniziale: ${creato.password}\n\nAl primo accesso puoi cambiarla con "Password dimenticata?".`, "Credenziali")}>Copia il messaggio</button>
+            <button className="btn ghost sm" onClick={() => setCreato(null)}>Fatto</button>
+          </div>
+          <div style={{fontSize:12, color:"var(--ink-3)", marginTop:8}}>La password non viene salvata da nessuna parte: copiala adesso. Se si perde, usa “Invia link nuova password”.</div>
+        </div>
+      )}
+
+      {nuovo && (
+        <form className="card" style={{padding:16, marginBottom:16}} onSubmit={crea}>
+          <div style={{fontWeight:600, marginBottom:10}}>Nuovo utente</div>
+          <div className="form-grid">
+            <div className="form-row"><label>Nome e cognome</label><input type="text" autoFocus value={nuovo.nome} onChange={e => setNuovo({ ...nuovo, nome: e.target.value })} /></div>
+            <div className="form-row"><label>Email</label><input type="email" value={nuovo.email} onChange={e => setNuovo({ ...nuovo, email: e.target.value })} /></div>
+            <div className="form-row"><label>Password iniziale</label>
+              <div style={{display:"flex", gap:8}}>
+                <input type="text" className="mono" value={nuovo.password} onChange={e => setNuovo({ ...nuovo, password: e.target.value })} style={{flex:1, minWidth:0}} />
+                <button type="button" className="btn ghost sm" onClick={() => setNuovo({ ...nuovo, password: generaPassword() })}>Genera</button>
+              </div>
+            </div>
+            <div className="form-row"><label>Ruolo</label>
+              <select value={nuovo.ruolo} onChange={e => setNuovo({ ...nuovo, ruolo: e.target.value })}>
+                {Object.entries(RUOLI).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+              </select>
+            </div>
+          </div>
+          {err && <div style={{color:"var(--danger)", fontSize:13, marginTop:8}}>{err}</div>}
+          <div style={{display:"flex", justifyContent:"flex-end", gap:8, marginTop:12}}>
+            <button type="button" className="btn ghost" onClick={() => setNuovo(null)}>Annulla</button>
+            <button type="submit" className="btn accent" disabled={busy}>{busy ? "Creo…" : "Crea utente"}</button>
+          </div>
+        </form>
+      )}
+
+      <div className="card" style={{padding:0, overflowX:"auto"}}>
+        <table className="tbl">
+          <thead><tr><th>Nome</th><th>Email</th><th>Ruolo</th><th>Stato</th><th>Creato</th><th></th></tr></thead>
+          <tbody>
+            {utenti.map(u => (
+              <tr key={u.uid} style={u.attivo === true ? {} : { opacity: 0.55 }}>
+                <td><b>{u.nome}</b>{UTENTE && u.uid === UTENTE.uid && <span style={{color:"var(--ink-3)"}}> (tu)</span>}</td>
+                <td>{u.email}</td>
+                <td>
+                  <select value={u.ruolo} onChange={e => cambia(u, { ruolo: e.target.value }, "Ruolo aggiornato")}>
+                    {Object.entries(RUOLI).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                  </select>
+                </td>
+                <td>{u.attivo === true ? <span className="pill">attivo</span> : <span className="pill">disattivato</span>}</td>
+                <td style={{fontSize:12, color:"var(--ink-3)"}}>{u.creatoIl ? fmtDate(u.creatoIl.slice(0, 10)) : ""}{u.creatoDa ? " · " + u.creatoDa : ""}</td>
+                <td>
+                  <div style={{display:"flex", gap:6, justifyContent:"flex-end", flexWrap:"wrap"}}>
+                    <button className="btn ghost sm" onClick={() => reset(u)} title="Manda all'utente un'email per scegliere una nuova password">Invia link nuova password</button>
+                    {u.attivo === true
+                      ? <button className="btn ghost sm" onClick={() => { if (confirm(`Disattivare ${u.nome}? Non potrà più entrare.`)) cambia(u, { attivo: false }, "Utente disattivato"); }}>Disattiva</button>
+                      : <button className="btn ghost sm" onClick={() => cambia(u, { attivo: true }, "Utente riattivato")}>Riattiva</button>}
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {utenti.length === 0 && <tr><td colSpan={6} style={{color:"var(--ink-3)", padding:16}}>Nessun utente.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card" style={{padding:16, marginTop:16}}>
+        <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", gap:8, flexWrap:"wrap"}}>
+          <div>
+            <div style={{fontWeight:600}}>Regole di sicurezza del database</div>
+            <div style={{fontSize:12.5, color:"var(--ink-3)"}}>Da incollare in Firebase → Realtime Database → Regole: così utenti, ruoli e registro valgono anche sul server.</div>
+          </div>
+          <div style={{display:"flex", gap:8}}>
+            <button className="btn ghost sm" onClick={() => setMostraRegole(!mostraRegole)}>{mostraRegole ? "Nascondi" : "Mostra"}</button>
+            <button className="btn sm" onClick={() => copia(REGOLE_DATABASE, "Regole")}>Copia regole</button>
+          </div>
+        </div>
+        {mostraRegole && <pre className="mono" style={{fontSize:11.5, background:"var(--bg)", padding:12, borderRadius:8, overflowX:"auto", marginTop:10}}>{REGOLE_DATABASE}</pre>}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// AMMINISTRAZIONE: REGISTRO ATTIVITA'
+// ============================================================
+// movIndice: { "<stagione>/<id>": movimento } per dare un nome ai movimenti toccati solo in parte
+function descriviRegistro(r, movIndice) {
+  const p = String(r.percorso || "");
+  const v = r.dopo || r.prima || {};
+  const nomeMov = (stag, id, mv) => {
+    const x = (mv && typeof mv === "object" && (mv.descrizione || mv.importo != null)) ? mv : (movIndice && movIndice[stag + "/" + id]);
+    return x ? `${x.descrizione || id}${x.importo != null ? " · " + fmt(x.importo) + " €" : ""}` : id;
+  };
+  let m;
+  if ((p === "" || p === "/") && v && typeof v === "object" && Object.keys(v).some(k => k === "pubblico/adminCreato")) {
+    const u = Object.entries(v).find(([k]) => k.startsWith("utenti/"));
+    return { sezione: "Utenti", testo: `Primo accesso: creato l'amministratore ${u && u[1] ? u[1].nome + " (" + u[1].email + ")" : ""}`.trim() };
+  }
+  if ((m = p.match(/^stagioni\/([^/]+)\/movimenti\/([^/]+)(\/(.+))?$/))) {
+    const campi = m[4] ? m[4] : (r.azione === "aggiorna" && v && typeof v === "object" ? Object.keys(r.dopo || {}).filter(k => k !== "modificatoIl").join(", ") : "");
+    return { sezione: "Movimenti", testo: `Movimento ${m[1]}${campi ? " [" + campi + "]" : ""}: ${nomeMov(m[1], m[2], v)}` };
+  }
+  if ((m = p.match(/^stagioni\/([^/]+)\/movimenti$/))) {
+    const chiavi = Object.keys(r.dopo || r.prima || {});
+    const ids = [...new Set(chiavi.map(k => k.split("/")[0]))];
+    const campi = [...new Set(chiavi.map(k => k.split("/").slice(1).join("/")).filter(c => c && c !== "modificatoIl"))];
+    if (ids.length === 1) return { sezione: "Movimenti", testo: `Movimento ${m[1]}${campi.length ? " [" + campi.join(", ") + "]" : ""}: ${nomeMov(m[1], ids[0], (r.dopo || {})[ids[0]])}` };
+    return { sezione: "Movimenti", testo: `${ids.length} movimenti ${m[1]}${campi.length ? " [" + campi.join(", ") + "]" : ""}: ${ids.slice(0, 3).map(id => nomeMov(m[1], id, (r.dopo || {})[id])).join(" · ")}${ids.length > 3 ? " …" : ""}` };
+  }
+  if ((m = p.match(/^stagioni\/([^/]+)\/conti(\/(.+))?$/))) return { sezione: "Piano dei conti", testo: `Piano dei conti ${m[1]}${v && v.nome ? ": " + (v.codice ? v.codice + " " : "") + v.nome : ""}` };
+  if ((m = p.match(/^stagioni\/([^/]+)\/schemaBilancio/))) return { sezione: "Schema di bilancio", testo: `Schema di bilancio ${m[1]}` };
+  if ((m = p.match(/^stagioni\/([^/]+)\/(\w+)/))) return { sezione: "Esercizio", testo: `Esercizio ${m[1]}: ${m[2]}` };
+  if ((m = p.match(/^stagioni\/([^/]+)$/))) return { sezione: "Esercizio", testo: `Esercizio ${m[1]}` };
+  if (/^utenti/.test(p)) return { sezione: "Utenti", testo: `Utente ${v && v.nome ? v.nome : ""}${v && v.email ? " (" + v.email + ")" : ""}`.trim() };
+  if (/^allegati/.test(p)) return { sezione: "Allegati", testo: `Allegato ${v && v.nome ? v.nome : ""}`.trim() };
+  if (/^impostazioni/.test(p)) return { sezione: "Impostazioni", testo: p.replace(/^impostazioni\//, "Impostazioni: ") };
+  if (/^analisi/.test(p)) return { sezione: "Analisi", testo: p };
+  return { sezione: "Altro", testo: p || "/" };
+}
+
+function differenze(prima, dopo) {
+  const piatto = (o, pre = "", out = {}) => {
+    if (o === null || o === undefined || typeof o !== "object") { out[pre || "(valore)"] = o; return out; }
+    if (o._omesso) { out[pre || "(valore)"] = `(contenuto grande, ${o.caratteri || o.chiavi} ${o.caratteri ? "caratteri" : "voci"})`; return out; }
+    Object.entries(o).forEach(([k, w]) => piatto(w, pre ? pre + "." + k : k, out));
+    return out;
+  };
+  const a = piatto(prima), b = piatto(dopo);
+  const chiavi = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort();
+  return chiavi.filter(k => JSON.stringify(a[k]) !== JSON.stringify(b[k])).map(k => ({ campo: k, prima: a[k], dopo: b[k] }));
+}
+
+function PageRegistro({ movimenti, stagione }) {
+  const movIndice = useMemo(() => { const o = {}; (movimenti || []).forEach(x => { if (x && x._id) o[stagione + "/" + x._id] = x; }); return o; }, [movimenti, stagione]);
+  const [righe, setRighe] = useState([]);
+  const [limite, setLimite] = useState(300);
+  const [errore, setErrore] = useState("");
+  const [fUtente, setFUtente] = useState("");
+  const [fSezione, setFSezione] = useState("");
+  const [fTesto, setFTesto] = useState("");
+  const [fDa, setFDa] = useState("");
+  const [fA, setFA] = useState("");
+  const [aperta, setAperta] = useState(null);
+  useEffect(() => {
+    const q = db.ref("registro").orderByKey().limitToLast(limite);
+    const cb = q.on("value", sn => {
+      const v = sn.val() || {};
+      setRighe(Object.entries(v).map(([id, r]) => ({ id, ...r })).reverse());
+      setErrore("");
+    }, e => setErrore(e && e.message ? e.message : "Registro non leggibile."));
+    return () => q.off("value", cb);
+  }, [limite]);
+  const righeD = useMemo(() => righe.map(r => ({ ...r, ...descriviRegistro(r, movIndice) })), [righe, movIndice]);
+  const utentiReg = [...new Set(righe.map(r => r.nome || r.email).filter(Boolean))].sort();
+  const sezioni = [...new Set(righeD.map(r => r.sezione))].sort();
+  const t = fTesto.trim().toLowerCase();
+  const vis = righeD.filter(r =>
+    (!fUtente || (r.nome || r.email) === fUtente) && (!fSezione || r.sezione === fSezione) &&
+    (!fDa || (r.quando || "").slice(0, 10) >= fDa) && (!fA || (r.quando || "").slice(0, 10) <= fA) &&
+    (!t || (r.testo + " " + r.percorso + " " + JSON.stringify(r.dopo || "") + " " + JSON.stringify(r.prima || "")).toLowerCase().includes(t)));
+  const AZ = { crea: "Creato", modifica: "Modificato", aggiorna: "Aggiornato", cancella: "Cancellato" };
+  const quando = (iso) => { const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleString("it-IT", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }); };
+  const val = (x) => x === undefined ? "—" : (x === null ? "∅" : (typeof x === "object" ? JSON.stringify(x) : String(x)));
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <h2>Registro attività</h2>
+          <div className="sub">Chi ha fatto cosa e quando · {vis.length} di {righe.length} operazioni più recenti</div>
+        </div>
+      </div>
+      {errore && <div className="card" style={{padding:12, color:"var(--danger)", marginBottom:12}}>{errore}</div>}
+      <div className="filters" style={{display:"flex", gap:8, flexWrap:"wrap", marginBottom:12}}>
+        <select value={fUtente} onChange={e => setFUtente(e.target.value)}><option value="">Tutti gli utenti</option>{utentiReg.map(u => <option key={u} value={u}>{u}</option>)}</select>
+        <select value={fSezione} onChange={e => setFSezione(e.target.value)}><option value="">Tutte le sezioni</option>{sezioni.map(u => <option key={u} value={u}>{u}</option>)}</select>
+        <input type="date" value={fDa} onChange={e => setFDa(e.target.value)} title="Dal" />
+        <input type="date" value={fA} onChange={e => setFA(e.target.value)} title="Al" />
+        <input type="text" value={fTesto} onChange={e => setFTesto(e.target.value)} placeholder="Cerca (descrizione, importo, numero…)" style={{flex:"1 1 200px"}} />
+      </div>
+      <div className="card" style={{padding:0, overflowX:"auto"}}>
+        <table className="tbl">
+          <thead><tr><th>Quando</th><th>Utente</th><th>Azione</th><th>Sezione</th><th>Cosa</th></tr></thead>
+          <tbody>
+            {vis.map(r => (
+              <React.Fragment key={r.id}>
+                <tr onClick={() => setAperta(aperta === r.id ? null : r.id)} style={{cursor:"pointer"}}>
+                  <td style={{whiteSpace:"nowrap"}}>{quando(r.quando)}</td>
+                  <td>{r.nome || r.email}</td>
+                  <td><span className="pill">{AZ[r.azione] || r.azione}</span></td>
+                  <td>{r.sezione}</td>
+                  <td>{r.testo} <span style={{color:"var(--ink-3)", fontSize:11}}>{aperta === r.id ? "▴" : "▾"}</span></td>
+                </tr>
+                {aperta === r.id && (
+                  <tr><td colSpan={5} style={{background:"var(--bg)"}}>
+                    <div style={{fontSize:11.5, color:"var(--ink-3)", marginBottom:6}} className="mono">{r.percorso} · {r.email}</div>
+                    <table className="tbl" style={{fontSize:12}}>
+                      <thead><tr><th>Campo</th><th>Prima</th><th>Dopo</th></tr></thead>
+                      <tbody>
+                        {differenze(r.prima, r.dopo).slice(0, 200).map(d => (
+                          <tr key={d.campo}><td className="mono">{d.campo}</td><td style={{color:"var(--danger)"}}>{val(d.prima)}</td><td style={{color:"var(--ok)"}}>{val(d.dopo)}</td></tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </td></tr>
+                )}
+              </React.Fragment>
+            ))}
+            {vis.length === 0 && <tr><td colSpan={5} style={{color:"var(--ink-3)", padding:16}}>Nessuna operazione registrata.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {righe.length >= limite && <div style={{textAlign:"center", marginTop:12}}><button className="btn ghost" onClick={() => setLimite(limite + 500)}>Carica operazioni più vecchie</button></div>}
     </div>
   );
 }
@@ -19749,11 +20274,7 @@ function PageAnalisi({ stagione, stagioniDisponibili, conti, movimenti, cespiti,
   );
 }
 
-function App() {
-  const [logged, setLogged] = useState(() => {
-    if (sessionStorage.getItem(SESSION_KEY) === "1") return true;
-    try { return localStorage.getItem(SESSION_KEY) === "1"; } catch (e) { return false; }
-  });
+function App({ utente }) {
   // La stagione attiva viene ricordata sul dispositivo. Se non c'e' una scelta
   // salvata, si parte da quella suggerita dalla data, ma NON si salta mai da soli
   // a una stagione che su Firebase non esiste ancora: al 1 gennaio l'esercizio
@@ -20022,7 +20543,6 @@ function App() {
     } catch(e) { alert("Errore: " + e.message); }
   };
 
-  if (!logged) return <Login onLogin={() => setLogged(true)} />;
 
   if (!firebaseReady) {
     return (
@@ -20050,7 +20570,8 @@ function App() {
         <span className="desktop-only" style={{ fontSize: 11, color: "var(--ink-3)", whiteSpace: "nowrap" }}>{diagStagione}</span>
         <button className="icon-btn" onClick={() => setPannelloStagioni(true)} title="Mostra tutte le stagioni presenti su Firebase">Stagioni</button>
         <button className="icon-btn desktop-only" onClick={newStagione}>+ Nuovo esercizio</button>
-        <button className="icon-btn" onClick={() => { sessionStorage.removeItem(SESSION_KEY); try { localStorage.removeItem(SESSION_KEY); } catch (e) {} setLogged(false); }}>Esci</button>
+        {utente && <span className="desktop-only" style={{fontSize:12, color:"var(--ink-2)", whiteSpace:"nowrap"}} title={utente.email}>{utente.nome} · {RUOLI[utente.ruolo] || utente.ruolo}</span>}
+        <button className="icon-btn" onClick={() => { if (firebase.auth) firebase.auth().signOut(); }}>Esci</button>
       </div>
 
       <div className="layout">
@@ -20093,6 +20614,13 @@ function App() {
           <button className={"navlink " + (page==="crediti"?"active":"")} onClick={() => setPage("crediti")}><span className="ico">🧾</span> Crediti</button>
           <button className={"navlink " + (page==="ammortamenti"?"active":"")} onClick={() => setPage("ammortamenti")}><span className="ico">⊟</span> Ammortamenti</button>
           <button className={"navlink " + (page==="cassa"?"active":"")} onClick={() => setPage("cassa")}><span className="ico">💵</span> Composizione Cassa</button>
+          {utente && utente.ruolo === "admin" && (
+            <>
+              <div className="section-label">Amministrazione</div>
+              <button className={"navlink " + (page==="utenti"?"active":"")} onClick={() => setPage("utenti")}><span className="ico">👤</span> Utenti</button>
+              <button className={"navlink " + (page==="registro"?"active":"")} onClick={() => setPage("registro")}><span className="ico">🕘</span> Registro attività</button>
+            </>
+          )}
         </nav>
         {sidebarOpen && <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)}></div>}
 
@@ -20146,6 +20674,9 @@ function App() {
               {page === "controller" && <PageController conti={conti} movimenti={movimenti} saldiIniziali={saldiInizialiEff} stagione={stagione} onToast={showToast} onApri={setPage} />}
               {page === "budget" && <PageBudget conti={conti} movimenti={movimenti} saldiIniziali={saldiInizialiEff} bu={bu} stagione={stagione} onToast={showToast} />}
               {page === "snapshot" && <PageSnapshot conti={conti} movimenti={movimenti} saldiIniziali={saldiInizialiEff} stagione={stagione} onToast={showToast} />}
+              {page === "utenti" && utente && utente.ruolo === "admin" && <PageUtenti onToast={showToast} />}
+              {page === "registro" && utente && utente.ruolo === "admin" && <PageRegistro movimenti={movimenti} stagione={stagione} />}
+              {utente && utente.ruolo === "lettura" && page === "nuovo" && <div className="card" style={{padding:14, marginBottom:12}}>Il tuo utente è in <b>sola lettura</b>: puoi consultare i dati ma non registrare movimenti.</div>}
               {page === "export" && <PageExport conti={conti} movimenti={movimenti} cespiti={cespiti} saldiIniziali={saldiInizialiEff} stagione={stagione} categorieRF={categorieRF} bu={bu} stagioniDisponibili={stagioniDisponibili} />}
               {page === "riapertura" && <PageRiapertura conti={conti} movimenti={movimenti} stagione={stagione} stagioniDisponibili={stagioniDisponibili} onToast={showToast} />}
               {page === "cespiti" && <PageCespiti cespiti={cespiti} stagione={stagione} onToast={showToast} />}
@@ -20276,16 +20807,9 @@ function App() {
   );
 }
 
-// Il database accetta solo client autenticati (regole "auth != null"):
-// prima dell'avvio l'app fa un accesso anonimo, poi monta l'interfaccia.
-const avviaApp = () => ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-if (firebaseReady && firebase.auth) {
-  firebase.auth().signInAnonymously()
-    .catch(e => console.warn("Accesso anonimo Firebase non riuscito:", e))
-    .finally(avviaApp);
-} else {
-  avviaApp();
-}
+// Avvio: Root mostra l'accesso con utente personale e, dopo il login di un
+// utente attivo (utenti/<uid>), monta l'app. Non c'e' piu' l'accesso anonimo.
+ReactDOM.createRoot(document.getElementById("root")).render(<Root />);
 </script>
 </body>
 </html>
