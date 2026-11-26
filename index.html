@@ -2,8 +2,13 @@
 <html lang="it">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Contabilità · Pro Loco</title>
+<meta name="theme-color" content="#1f6fb0">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Contabilità">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1631,7 +1636,77 @@ function Login({ adminCreato, messaggio }) {
 }
 
 // Decide cosa mostrare: accesso, utente non autorizzato, oppure l'app.
+// ============================================================
+// AGGIORNAMENTI DELL'APP
+// L'app e' una sola pagina pubblicata su GitHub Pages. Il telefono (soprattutto
+// se l'app e' sulla schermata Home, dove non c'e' il tasto Ricarica) puo'
+// tenere in memoria la versione vecchia. Confronto la data di pubblicazione
+// della pagina che sto usando (document.lastModified) con quella sul sito
+// (intestazione Last-Modified): se il sito e' piu' nuovo, propongo "Aggiorna ora".
+// Controllo all'apertura, quando si torna sull'app e ogni 5 minuti.
+// ============================================================
+const AGG_PARAM = "agg";
+(() => {   // tolgo dall'indirizzo il parametro usato per forzare il ricaricamento
+  try {
+    const u = new URL(location.href);
+    if (u.searchParams.has(AGG_PARAM) || u.searchParams.has("v")) {
+      u.searchParams.delete(AGG_PARAM); u.searchParams.delete("v");
+      history.replaceState(null, "", u.pathname + (u.searchParams.toString() ? "?" + u.searchParams : "") + u.hash);
+    }
+  } catch (e) {}
+})();
+
+function useAggiornamentoDisponibile() {
+  const [disponibile, setDisponibile] = useState(false);
+  useEffect(() => {
+    if (!/^https?:$/.test(location.protocol)) return;
+    const mia = Date.parse(document.lastModified);
+    if (!isFinite(mia)) return;
+    let fermo = false;
+    const controlla = async () => {
+      if (fermo || document.visibilityState === "hidden") return;
+      try {
+        const r = await fetch(location.pathname + "?" + AGG_PARAM + "c=" + Date.now(), { method: "HEAD", cache: "no-store" });
+        const lm = Date.parse(r.headers.get("last-modified") || "");
+        if (r.ok && isFinite(lm) && lm - mia > 2000) setDisponibile(true);
+      } catch (e) {}
+    };
+    controlla();
+    const t = setInterval(controlla, 5 * 60 * 1000);
+    const vis = () => { if (document.visibilityState === "visible") controlla(); };
+    document.addEventListener("visibilitychange", vis);
+    window.addEventListener("focus", vis);
+    return () => { fermo = true; clearInterval(t); document.removeEventListener("visibilitychange", vis); window.removeEventListener("focus", vis); };
+  }, []);
+  return disponibile;
+}
+
+function aggiornaApp() {
+  // nuovo indirizzo = la pagina non puo' arrivare dalla memoria del telefono
+  location.replace(location.pathname + "?" + AGG_PARAM + "=" + Date.now() + location.hash);
+}
+
+function AvvisoAggiornamento() {
+  const disponibile = useAggiornamentoDisponibile();
+  const [nascosto, setNascosto] = useState(false);
+  if (!disponibile || nascosto) return null;
+  return (
+    <div role="status" style={{position:"fixed", left:"50%", transform:"translateX(-50%)", bottom:"calc(16px + env(safe-area-inset-bottom, 0px))", zIndex:1000,
+      background:"#1a1a1a", color:"#ffffff", borderRadius:12, padding:"10px 10px 10px 16px", display:"flex", alignItems:"center", gap:12,
+      boxShadow:"0 8px 24px rgba(0,0,0,.25)", fontSize:14, maxWidth:"calc(100vw - 24px)", boxSizing:"border-box"}}>
+      <span>È disponibile una nuova versione dell'app.</span>
+      <button className="btn accent" onClick={aggiornaApp} style={{whiteSpace:"nowrap", minHeight:40}}>Aggiorna ora</button>
+      <button onClick={() => setNascosto(true)} aria-label="Più tardi" title="Più tardi"
+        style={{background:"transparent", border:0, color:"rgba(255,255,255,.7)", fontSize:18, cursor:"pointer", padding:"4px 6px"}}>✕</button>
+    </div>
+  );
+}
+
 function Root() {
+  return <><RootContenuto /><AvvisoAggiornamento /></>;
+}
+
+function RootContenuto() {
   const [stato, setStato] = useState({ fase: "carico" });
   const [adminCreato, setAdminCreato] = useState(null);
   useEffect(() => {
@@ -20821,7 +20896,7 @@ function App({ utente }) {
   );
 }
 
-// Avvio: Root mostra l'accesso con utente personale e, dopo il login di un
+// Avvio (Root = contenuto + avviso aggiornamenti): Root mostra l'accesso con utente personale e, dopo il login di un
 // utente attivo (utenti/<uid>), monta l'app. Non c'e' piu' l'accesso anonimo.
 ReactDOM.createRoot(document.getElementById("root")).render(<Root />);
 </script>
