@@ -77,6 +77,14 @@
   /* === LAYOUT === */
   .app { min-height: 100vh; display: flex; flex-direction: column; }
 
+  body.in-prova .topbar { background: #b4561c; }
+  .banda-prova {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    background: #fff1e0; border: 1px solid #f0b47a; color: #7a3a0c; border-radius: 10px;
+    padding: 9px 12px; margin-bottom: 16px; font-size: 13px;
+  }
+  .banda-prova .btn { background: #fff; color: #7a3a0c; border: 1px solid #f0b47a; }
+  .banda-prova .btn:hover { background: #ffe3c4; }
   .topbar {
     background: var(--brand);
     color: #ffffff;
@@ -1163,6 +1171,31 @@ function _verificaScrittura(stag, valore) {
 // Le stesse regole valgono anche sul server (regole del database, vedi PageUtenti).
 // ============================================================
 let UTENTE = null;
+
+// ============================================================
+// AREA DI PROVA
+// Ogni utente ha una copia personale dei dati in prove/<uid>/ (stagioni,
+// allegati, analisi, impostazioni). Quando l'area di prova e' accesa, db.ref()
+// dirotta li' questi percorsi: l'app funziona identica, ma la contabilita'
+// vera non viene toccata. Le scritture di prova non vanno nel registro.
+// La scelta e' per utente e per dispositivo (localStorage).
+// ============================================================
+let PROVA_UID = null;
+const PROVA_RADICI = ["stagioni", "allegati", "analisi", "impostazioni"];
+const PROVA_KEY = uid => "areaProva:" + uid;
+let _refVero = null;    // db.ref senza dirottamento: per copiare i dati veri e leggere gli allegati veri
+function provaAttivaPer(uid) { try { return !!uid && localStorage.getItem(PROVA_KEY(uid)) === "1"; } catch (e) { return false; } }
+function impostaProva(uid) {
+  PROVA_UID = provaAttivaPer(uid) ? uid : null;
+  try { document.body.classList.toggle("in-prova", !!PROVA_UID); } catch (e) {}
+}
+function _percorsoProva(pp) {
+  if (!PROVA_UID || !pp) return pp;
+  const radice = pp.split("/")[0];
+  return PROVA_RADICI.includes(radice) ? `prove/${PROVA_UID}/${pp}` : pp;
+}
+const _eProva = pp => /^prove\//.test(pp || "");
+
 const RUOLI = { admin: "Amministratore", operatore: "Operatore", lettura: "Sola lettura" };
 const isAdmin = () => !!UTENTE && UTENTE.ruolo === "admin";
 const REGISTRO_MAX_CHAR = 30000;   // oltre, nel registro resta solo la dimensione
@@ -1183,7 +1216,7 @@ function _perRegistro(v, percorso) {
 }
 
 function _registra(rawRef, azione, percorso, prima, dopo) {
-  if (/^registro(\/|$)/.test(percorso)) return;
+  if (/^registro(\/|$)/.test(percorso) || _eProva(percorso)) return;
   const u = UTENTE || (firebase.auth && firebase.auth().currentUser ? { uid: firebase.auth().currentUser.uid, nome: firebase.auth().currentUser.email || "", email: firebase.auth().currentUser.email || "", ruolo: "" } : null);
   if (!u) return;
   const riga = {
@@ -1196,6 +1229,7 @@ function _registra(rawRef, azione, percorso, prima, dopo) {
 
 function _controllaPermesso(percorso) {
   if (/^registro(\/|$)/.test(percorso)) return;
+  if (UTENTE && _eProva(percorso) && percorso.split("/")[1] === UTENTE.uid) return;   // nella propria area di prova si puo' sempre scrivere
   if (UTENTE && UTENTE.ruolo === "lettura") {
     throw new Error("Il tuo utente è in sola lettura: non può modificare i dati. Chiedi all'amministratore.");
   }
@@ -1206,7 +1240,7 @@ if (db) {
   const unisci = (a, b) => [a, b].filter(Boolean).join("/").replace(/\/+/g, "/").replace(/^\/|\/$/g, "");
   const avvolgi = (ref, percorso) => {
     const raw = { set: ref.set.bind(ref), update: ref.update.bind(ref), remove: ref.remove.bind(ref), push: ref.push.bind(ref), child: ref.child.bind(ref) };
-    const mm = percorso.match(/^stagioni\/([^/]+)\/movimenti(\/|$)/);
+    const mm = percorso.match(/^(?:prove\/[^/]+\/)?stagioni\/([^/]+)\/movimenti(\/|$)/);
     const verificaMov = (v) => { if (mm) _verificaScrittura(mm[1], v); };
     const leggi = (pp) => (/^allegati(\/|$)/.test(pp) ? Promise.resolve(null) : _ref(pp).once("value").then(sn => sn.val()).catch(() => null));
     ref.set = (v, ...a) => {
@@ -1239,9 +1273,11 @@ if (db) {
     ref.child = (c, ...a) => avvolgi(raw.child(c, ...a), unisci(percorso, String(c)));
     return ref;
   };
+  _refVero = _ref;
   db.ref = function (path) {
-    const r = _ref(path);
-    return avvolgi(r, unisci(typeof path === "string" ? path : "", ""));
+    const pp = _percorsoProva(unisci(typeof path === "string" ? path : "", ""));
+    const r = (typeof path === "string" && pp) ? _ref(pp) : _ref(path);
+    return avvolgi(r, pp);
   };
 }
 
@@ -1667,6 +1703,126 @@ function SchermataBlocco({ utente, cfg, onSblocca, onEsci }) {
   );
 }
 
+// Copia i dati veri nell'area di prova dell'utente (sovrascrive quella che c'e').
+async function copiaDatiInProva(uid) {
+  const ora = new Date().toISOString();
+  const leggi = async pp => { try { return (await _refVero(pp).once("value")).val(); } catch (e) { return null; } };
+  const stagioni = await leggi("stagioni");
+  const analisi = await leggi("analisi");
+  const impostazioni = await leggi("impostazioni");
+  await _refVero(`prove/${uid}`).set({
+    stagioni: stagioni || null, analisi: analisi || null, impostazioni: impostazioni || null,
+    meta: { copiataIl: ora, daStagioni: Object.keys(stagioni || {}).sort().join(", ") },
+  });
+  return Object.keys(stagioni || {}).length;
+}
+function cambiaModoProva(uid, accendi) {
+  try {
+    if (accendi) localStorage.setItem(PROVA_KEY(uid), "1"); else localStorage.removeItem(PROVA_KEY(uid));
+    sessionStorage.setItem("saltaBlocco", uid);
+  } catch (e) {}
+  const u = new URL(location.href); u.searchParams.delete("agg");
+  location.replace(u.pathname + u.search + u.hash);
+}
+function BandaProva({ onApri }) {
+  if (!PROVA_UID) return null;
+  return (
+    <div className="banda-prova" role="status">
+      <span>🧪 <b>Area di prova</b> · quello che fai qui non tocca la contabilità vera</span>
+      <span style={{display:"flex", gap:8}}>
+        <button className="btn sm" onClick={onApri}>Gestisci</button>
+        <button className="btn sm" onClick={() => cambiaModoProva(PROVA_UID, false)}>Torna ai dati veri</button>
+      </span>
+    </div>
+  );
+}
+function PageAreaProva({ utente, onToast }) {
+  const inProva = !!PROVA_UID;
+  const [meta, setMeta] = useState(undefined);
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    if (!_refVero) return;
+    const r = _refVero(`prove/${utente.uid}/meta`);
+    const cb = r.on("value", sn => setMeta(sn.val()), () => setMeta(null));
+    return () => r.off("value", cb);
+  }, [utente.uid]);
+  const quando = iso => { try { return new Date(iso).toLocaleString("it-IT", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }); } catch (e) { return iso; } };
+  const entra = async () => {
+    setErr("");
+    try {
+      if (!meta) { setBusy("Copio i dati veri nella tua area di prova…"); await copiaDatiInProva(utente.uid); }
+      cambiaModoProva(utente.uid, true);
+    } catch (e) { setBusy(""); setErr("Non riesco a preparare l'area di prova: " + (e.message || e)); }
+  };
+  const ricomincia = async () => {
+    if (!confirm("Ricominciare da capo?\n\nTutto quello che hai fatto nell'area di prova viene cancellato e sostituito con una copia dei dati veri di adesso. La contabilità vera non cambia.")) return;
+    setErr(""); setBusy("Ricopio i dati veri…");
+    try {
+      const n = await copiaDatiInProva(utente.uid);
+      if (inProva) cambiaModoProva(utente.uid, true);
+      else { setBusy(""); onToast && onToast(`Area di prova rifatta (${n} esercizi copiati)`); }
+    } catch (e) { setBusy(""); setErr("Non riesco a ricopiare i dati: " + (e.message || e)); }
+  };
+  const elimina = async () => {
+    if (!confirm("Eliminare la tua area di prova?\n\nVengono cancellate solo le tue prove. La contabilità vera non cambia.")) return;
+    setErr(""); setBusy("Elimino l'area di prova…");
+    try {
+      await _refVero(`prove/${utente.uid}`).remove();
+      if (inProva) cambiaModoProva(utente.uid, false);
+      else { setBusy(""); onToast && onToast("Area di prova eliminata"); }
+    } catch (e) { setBusy(""); setErr("Non riesco a eliminarla: " + (e.message || e)); }
+  };
+  return (
+    <div>
+      <div className="page-head">
+        <div>
+          <h2>Area di prova</h2>
+          <div className="sub">Una copia personale dei dati per esercitarsi e fare tentativi, senza toccare la contabilità vera</div>
+        </div>
+      </div>
+      {err && <div className="card" style={{padding:12, marginBottom:12, color:"var(--danger)"}}>{err}</div>}
+      <div className="card" style={{padding:16, marginBottom:12}}>
+        <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", gap:12, flexWrap:"wrap"}}>
+          <div>
+            <div style={{fontWeight:600}}>{inProva ? "🧪 Sei nell'area di prova" : "Stai lavorando sui dati veri"}</div>
+            <div style={{fontSize:12.5, color:"var(--ink-2)", marginTop:2}}>
+              {meta === undefined ? "Controllo…"
+                : meta ? `La tua copia è del ${quando(meta.copiataIl)}${meta.daStagioni ? " (esercizi " + meta.daStagioni + ")" : ""}.`
+                : "Non hai ancora un'area di prova: entrando la creo con una copia dei dati veri di adesso."}
+            </div>
+          </div>
+          <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
+            {inProva
+              ? <button className="btn accent" disabled={!!busy} onClick={() => cambiaModoProva(utente.uid, false)}>Torna ai dati veri</button>
+              : <button className="btn accent" disabled={!!busy || meta === undefined} onClick={entra}>Entra nell'area di prova</button>}
+          </div>
+        </div>
+        {busy && <div style={{fontSize:12.5, marginTop:10}}>{busy}</div>}
+      </div>
+      {meta && (
+        <div className="card" style={{padding:16, marginBottom:12}}>
+          <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", gap:12, flexWrap:"wrap"}}>
+            <div>
+              <div style={{fontWeight:600}}>Ricomincia da capo</div>
+              <div style={{fontSize:12.5, color:"var(--ink-2)", marginTop:2}}>Butta via le prove e riparte da una copia aggiornata dei dati veri.</div>
+            </div>
+            <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
+              <button className="btn" disabled={!!busy} onClick={ricomincia}>Ricopia i dati veri</button>
+              <button className="btn ghost" disabled={!!busy} onClick={elimina}>Elimina l'area di prova</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <div style={{fontSize:12.5, lineHeight:1.6, color:"var(--ink-3)", maxWidth:700}}>
+        Nell'area di prova l'app è identica: puoi registrare, modificare e cancellare movimenti, cambiare il piano dei conti, creare esercizi.
+        È solo tua, gli altri utenti non la vedono, e anche chi è in sola lettura può fare prove.
+        Quando sei in prova la barra in alto diventa arancione. Le prove non finiscono nel registro attività e non vengono mai copiate nei dati veri.
+      </div>
+    </div>
+  );
+}
+
 function PageAccessoRapido({ utente, onToast }) {
   const [cfg, setCfg] = useState(() => leggiSblocco(utente.uid) || {});
   const [bioOk, setBioOk] = useState(null);
@@ -1968,8 +2124,10 @@ function RootContenuto() {
   React.useLayoutEffect(() => {
     if (!uidApp) { setCfgSbl(null); setBloccato(false); return; }
     const c = leggiSblocco(uidApp);
+    let salta = false;
+    try { salta = sessionStorage.getItem("saltaBlocco") === uidApp; sessionStorage.removeItem("saltaBlocco"); } catch (e) {}
     setCfgSbl(c);
-    setBloccato(!!c && !APPENA_AUTENTICATO);
+    setBloccato(!!c && !APPENA_AUTENTICATO && !salta);
     APPENA_AUTENTICATO = false;
     const rileggi = () => setCfgSbl(leggiSblocco(uidApp));
     let via = null;
@@ -2019,6 +2177,7 @@ function RootContenuto() {
           return;
         }
         UTENTE = { uid: user.uid, nome: u.nome || user.email, email: u.email || user.email, ruolo: u.ruolo || "lettura" };
+        impostaProva(user.uid);
         setStato({ fase: "app", utente: { ...UTENTE } });
       }, () => {
         UTENTE = null;
@@ -2079,6 +2238,9 @@ const REGOLE_DATABASE = (() => {
       registro: {
         ".read": admin,
         "$id": { ".write": attivo + " && !data.exists() && newData.child('uid').val() === auth.uid" },
+      },
+      prove: {
+        "$uid": { ".read": "auth != null && auth.uid === $uid && " + attivo, ".write": "auth != null && auth.uid === $uid && " + attivo },
       },
       "$altro": { ".read": attivo, ".write": scrive },
     },
@@ -2472,8 +2634,8 @@ async function apriAllegato(a) {
   const w = window.open("", "_blank");
   try {
     if (w) w.document.write("<p style='font:16px sans-serif;padding:20px'>Apro il documento…</p>");
-    const snap = await db.ref(`${ALLEGATI_PATH}/${a.id}`).once("value");
-    const v = snap.val();
+    let v = (await db.ref(`${ALLEGATI_PATH}/${a.id}`).once("value")).val();
+    if (!v && PROVA_UID && _refVero) v = (await _refVero(`${ALLEGATI_PATH}/${a.id}`).once("value")).val();
     if (!v || !v.dati) throw new Error("Allegato non trovato nel database.");
     const bin = atob(v.dati); const arr = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
@@ -20998,6 +21160,7 @@ function App({ utente, onBlocca }) {
           {utente && (
             <>
               <div className="section-label">Il mio accesso</div>
+              <button className={"navlink " + (page==="prova"?"active":"")} onClick={() => setPage("prova")}><span className="ico">🧪</span> Area di prova{PROVA_UID ? " · attiva" : ""}</button>
               <button className={"navlink " + (page==="accesso"?"active":"")} onClick={() => setPage("accesso")}><span className="ico">🔐</span> Accesso rapido</button>
             </>
           )}
@@ -21012,6 +21175,7 @@ function App({ utente, onBlocca }) {
         {sidebarOpen && <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)}></div>}
 
         <main className="main">
+          <BandaProva onApri={() => setPage("prova")} />
           {loading ? (
             <div className="empty-state">Caricamento dati…</div>
           ) : (
@@ -21061,10 +21225,11 @@ function App({ utente, onBlocca }) {
               {page === "controller" && <PageController conti={conti} movimenti={movimenti} saldiIniziali={saldiInizialiEff} stagione={stagione} onToast={showToast} onApri={setPage} />}
               {page === "budget" && <PageBudget conti={conti} movimenti={movimenti} saldiIniziali={saldiInizialiEff} bu={bu} stagione={stagione} onToast={showToast} />}
               {page === "snapshot" && <PageSnapshot conti={conti} movimenti={movimenti} saldiIniziali={saldiInizialiEff} stagione={stagione} onToast={showToast} />}
+              {page === "prova" && utente && <PageAreaProva utente={utente} onToast={showToast} />}
               {page === "accesso" && utente && <PageAccessoRapido utente={utente} onToast={showToast} />}
               {page === "utenti" && utente && utente.ruolo === "admin" && <PageUtenti onToast={showToast} />}
               {page === "registro" && utente && utente.ruolo === "admin" && <PageRegistro movimenti={movimenti} stagione={stagione} />}
-              {utente && utente.ruolo === "lettura" && page === "nuovo" && <div className="card" style={{padding:14, marginBottom:12}}>Il tuo utente è in <b>sola lettura</b>: puoi consultare i dati ma non registrare movimenti.</div>}
+              {utente && utente.ruolo === "lettura" && !PROVA_UID && page === "nuovo" && <div className="card" style={{padding:14, marginBottom:12}}>Il tuo utente è in <b>sola lettura</b>: puoi consultare i dati ma non registrare movimenti.</div>}
               {page === "export" && <PageExport conti={conti} movimenti={movimenti} cespiti={cespiti} saldiIniziali={saldiInizialiEff} stagione={stagione} categorieRF={categorieRF} bu={bu} stagioniDisponibili={stagioniDisponibili} />}
               {page === "riapertura" && <PageRiapertura conti={conti} movimenti={movimenti} stagione={stagione} stagioniDisponibili={stagioniDisponibili} onToast={showToast} />}
               {page === "cespiti" && <PageCespiti cespiti={cespiti} stagione={stagione} onToast={showToast} />}
