@@ -2240,7 +2240,7 @@ const REGOLE_DATABASE = (() => {
         "$id": { ".write": attivo + " && !data.exists() && newData.child('uid').val() === auth.uid" },
       },
       prove: {
-        "$uid": { ".read": "auth != null && auth.uid === $uid && " + attivo, ".write": "auth != null && auth.uid === $uid && " + attivo },
+        "$uid": { ".read": attivo + " && auth.uid === $uid", ".write": attivo + " && auth.uid === $uid" },
       },
       "$altro": { ".read": attivo, ".write": scrive },
     },
