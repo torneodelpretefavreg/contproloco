@@ -5704,6 +5704,9 @@ function PageLibroGiornale({ conti, movimenti, saldiIniziali }) {
   const [tab, setTab] = useState("cron"); // cron | mastrino
   const [contoMastrino, setContoMastrino] = useState("");
   const [filterBu, setFilterBu] = useState(""); // "" = tutte le BU
+  // Ordine della vista cronologica (ricordato su questo dispositivo)
+  const [ordine, setOrdine] = useState(() => { try { return localStorage.getItem("libroGiornale:ordine") || "cron"; } catch (e) { return "cron"; } });
+  useEffect(() => { try { localStorage.setItem("libroGiornale:ordine", ordine); } catch (e) {} }, [ordine]);
 
   const contiMap = useMemo(() => {
     const m = {};
@@ -5727,10 +5730,28 @@ function PageLibroGiornale({ conti, movimenti, saldiIniziali }) {
   // Scritture filtrate per BU: filtro scritture INTERE (entrambe le righe
   // condividono la stessa BU), così il giornale resta quadrato dentro la BU.
   // L'apertura (bu null) viene mostrata solo quando non c'è filtro attivo.
-  const scrittureView = useMemo(
-    () => filterBu ? scritture.filter(s => s.bu === filterBu) : scritture,
-    [scritture, filterBu]
-  );
+  // Ogni scrittura tiene il suo numero progressivo cronologico (N.), qualunque sia l'ordine scelto.
+  const scrittureView = useMemo(() => {
+    const numerate = scritture.map((s, i) => ({ ...s, n: i + 1 }));
+    const lista = filterBu ? numerate.filter(s => s.bu === filterBu) : numerate;
+    if (ordine === "cron") return lista;
+    if (ordine === "recenti") return [...lista].sort((a, b) => (b.data || "").localeCompare(a.data || "") || b.n - a.n);
+    if (ordine === "importo") {
+      const tot = s => s.righe.reduce((t, r) => t + (r.dare || 0), 0);
+      return [...lista].sort((a, b) => tot(b) - tot(a) || a.n - b.n);
+    }
+    // ordine di registrazione: quando il movimento e' stato inserito (gli importati seguono il n. di prima nota)
+    const perId = {}, perScrittura = {};
+    (movimenti || []).forEach(m => { if (!m) return; if (m._id) perId[m._id] = m; if (m.scritturaId && !perScrittura[m.scritturaId]) perScrittura[m.scritturaId] = m; });
+    const chiave = s => {
+      const m = (s.movId && perId[s.movId]) || (s.scritturaId && perScrittura[s.scritturaId]) || null;
+      if (!m) return ["", -1];   // apertura: sempre per prima
+      return [m.creatoIl || "", Number.isFinite(Number(m.rifPrimaNota)) ? Number(m.rifPrimaNota) : 1e9];
+    };
+    return [...lista].map(s => ({ s, k: chiave(s) }))
+      .sort((a, b) => a.k[0].localeCompare(b.k[0]) || a.k[1] - b.k[1] || a.s.n - b.s.n)
+      .map(x => x.s);
+  }, [scritture, filterBu, ordine, movimenti]);
 
   // Verifica chiusura evento: saldo residuo sui conti transitori 74/75 per la BU.
   // A fine evento devono essere chiusi (saldo ≈ 0).
@@ -5820,7 +5841,7 @@ function PageLibroGiornale({ conti, movimenti, saldiIniziali }) {
       <div className="page-head">
         <div>
           <h2>Libro Giornale</h2>
-          <div className="sub">{scrittureView.length}{filterBu ? ` di ${scritture.length}` : ""} scritture · vista cronologica o per conto (mastrino)</div>
+          <div className="sub">{scrittureView.length}{filterBu ? ` di ${scritture.length}` : ""} scritture · vista {tab === "cron" ? ({ cron: "cronologica", recenti: "dalla più recente", registrazione: "in ordine di registrazione", importo: "per importo" }[ordine] || "cronologica") : "per conto (mastrino)"}</div>
         </div>
         <div style={{display:"flex", gap:8, alignItems:"baseline"}}>
           <span className="mono" style={{fontSize:12.5, color:"var(--ink-3)"}}>
@@ -5845,6 +5866,17 @@ function PageLibroGiornale({ conti, movimenti, saldiIniziali }) {
         </select>
         {filterBu && (
           <button className="btn ghost sm" onClick={() => setFilterBu("")}>Reset BU</button>
+        )}
+        {tab === "cron" && (
+          <>
+            <span className="label" style={{marginLeft:8}}>Ordine:</span>
+            <select value={ordine} onChange={e => setOrdine(e.target.value)} style={{maxWidth:260}} aria-label="Ordine delle scritture">
+              <option value="cron">Cronologico (dalla più vecchia)</option>
+              <option value="recenti">Dalla più recente</option>
+              <option value="registrazione">Ordine di registrazione</option>
+              <option value="importo">Importo (dal più alto)</option>
+            </select>
+          </>
         )}
         {filterBu && (
           <span className="mono" style={{fontSize:12, color:"var(--ink-3)", marginLeft:"auto"}}>
@@ -5895,6 +5927,7 @@ function PageLibroGiornale({ conti, movimenti, saldiIniziali }) {
           <table className="tbl">
             <thead>
               <tr>
+                <th className="num" style={{width:46}} title="Numero progressivo in ordine cronologico">N.</th>
                 <th style={{width:90}}>Data</th>
                 <th style={{width:50}}>Cod.</th>
                 <th>Conto</th>
@@ -5908,6 +5941,7 @@ function PageLibroGiornale({ conti, movimenti, saldiIniziali }) {
                 <React.Fragment key={idx}>
                   {s.righe.map((r, ri) => (
                     <tr key={`${idx}-${ri}`} style={ri === 0 ? {borderTop: s.composta ? "2px solid #7c3aed" : "2px solid var(--rule-2)"} : {}}>
+                      <td className="num mono" style={{color:"var(--ink-3)"}}>{ri === 0 ? s.n : ""}</td>
                       <td>{ri === 0 ? fmtDate(s.data) : ""}</td>
                       <td className="mono" style={{fontWeight:600}}>{String(r.codice).padStart(2,"0")}</td>
                       <td>{r.nome.trim()}</td>
