@@ -810,8 +810,17 @@
       -webkit-overflow-scrolling: touch;
       border-radius: 8px;
     }
-    table.tbl { font-size: 12px; min-width: 600px; }
-    table.tbl th { padding: 8px 10px; font-size: 9.5px; }
+    /* Larghezza minima solo per le tabelle che hanno un riquadro scorrevole:
+       le altre (due o tre colonne) si adattano allo schermo. */
+    table.tbl { font-size: 12px; }
+    .tbl-wrap > table.tbl { min-width: 600px; }
+    table.tbl th { padding: 8px 10px; font-size: 10.5px; }
+
+    /* Nessun riquadro piu' largo dello schermo: caselle di griglie e righe
+       flessibili possono restringersi (altrimenti si allarga tutta la pagina
+       e titoli e testi scorrono di lato insieme alle tabelle). */
+    .main .card, .card-grid > *,
+    .main [style*="display: grid"] > *, .main [style*="display:grid"] > * { min-width: 0; }
     table.tbl td { padding: 8px 10px; }
     table.tbl td.num, table.tbl th.num { font-size: 11.5px; }
 
@@ -868,6 +877,19 @@
   .rf-compact table.tbl td { padding: 5px 7px; }
   .rf-compact table.tbl td.num, .rf-compact table.tbl th.num { font-size: 10.5px; }
   .rf-table .rf-sez-label { position: sticky; left: 7px; display: inline-block; }
+  .rf-ricl-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .ind-formula-sotto { display: none; }
+  @media (max-width: 640px) {
+    /* Esplora e Indici su telefono: la tabella sta nello schermo e il testo va a capo */
+    table.esp-tbl, table.ind-tbl { min-width: 0 !important; }
+    /* Esplora: la colonna delle voci resta leggibile (min 190px); se i numeri non
+       ci stanno, scorre solo la tabella dentro il suo riquadro */
+    table.esp-tbl th:not(.num), table.esp-tbl td:not(.num) { white-space: normal; overflow-wrap: break-word; min-width: 190px; }
+    table.esp-tbl td.num, table.esp-tbl th.num { padding-left: 6px; padding-right: 6px; }
+    table.ind-tbl .ind-formula { display: none; }
+    .ind-formula-sotto { display: block; font-weight: 400; font-size: 11px; color: var(--ink-3); margin-top: 2px; }
+  }
+  .rf-ricl-scroll > table { min-width: 100%; }
   .rf-table td.num, .rf-table th.num { white-space: nowrap; }
   .rf-table tr.rf-sep > td { border-top: 1.5px solid var(--ink); }
   .rf-table tr.rf-sep-2 > td { border-top-width: 2px; }
@@ -16301,7 +16323,8 @@ function generaPdfRfRiclassificato(R, stagione, doc, titolo, conDettaglio, prec)
 // Vista a schermo (componente a livello di modulo, come gli altri editor dello schema)
 function SBRfRiclassificato({ R, Rp, precStagione, variazioni, stagione }) {
   const [dettaglio, setDettaglio] = useState(false);
-  const [perc, setPerc] = useState(true);
+  // su telefono si parte senza le colonne "% ric.", per far stare la tabella nello schermo
+  const [perc, setPerc] = useState(() => { try { return !window.matchMedia("(max-width: 640px)").matches; } catch (e) { return true; } });
   if (!R) return null;
   const conf = !!Rp;
   // incidenza % sui ricavi operativi (solo righe del conto economico)
@@ -16350,6 +16373,7 @@ function SBRfRiclassificato({ R, Rp, precStagione, variazioni, stagione }) {
         Dall'EBITDA al free cash flow. Legge le voci del conto economico dallo schema e le variazioni
         patrimoniali tra apertura e chiusura, classificate secondo la natura dei conti impostata in Struttura RF.
       </div>
+      <div className="rf-ricl-scroll">
       <table style={{ width: "100%" }}>
         <tbody>
           {(conf || perc) && (
@@ -16387,6 +16411,7 @@ function SBRfRiclassificato({ R, Rp, precStagione, variazioni, stagione }) {
           })}
         </tbody>
       </table>
+      </div>
       {scartiDiArrotondamento(righe) && (
         <div style={{ marginTop: 10, fontSize: 11.5, color: "var(--ink-3)", fontStyle: "italic", lineHeight: 1.5 }}>
           Importi in unità di euro: ogni riga è arrotondata singolarmente, quindi una somma può differire
@@ -17658,9 +17683,9 @@ function SBIndici({ schema, stagione, stagioniDisponibili, corrente, contiMap, o
       <div className="card" style={{ overflowX: "auto" }}>
         {inCaricamento && <div style={{ fontSize: 12, color: "var(--ink-3)", marginBottom: 8 }}>Carico le stagioni a confronto…</div>}
         {!gruppi.length ? <div className="empty-state">Nessun indice selezionato: usa «Scegli indici».</div> : (
-          <table className="tbl" style={{ minWidth: 560 }}>
+          <table className="tbl ind-tbl" style={{ minWidth: 560 }}>
             <thead>
-              <tr><th>Indice</th><th style={{ color: "var(--ink-3)", fontWeight: 500 }}>Formula</th>
+              <tr><th>Indice</th><th className="ind-formula" style={{ color: "var(--ink-3)", fontWeight: 500 }}>Formula</th>
                 {colonne.map((c, i) => <th key={c.label} className="num">{c.label}{i > 0 && !c.g ? " …" : ""}</th>)}</tr>
             </thead>
             <tbody>
@@ -17669,8 +17694,8 @@ function SBIndici({ schema, stagione, stagioniDisponibili, corrente, contiMap, o
                   <tr><td colSpan={2 + colonne.length} style={{ fontFamily: "'Fraunces',serif", fontSize: 14, paddingTop: 14, borderBottom: "1px solid var(--rule-2)" }}>{g.nome}</td></tr>
                   {g.righe.map(r => (
                     <tr key={r.id}>
-                      <td style={{ fontWeight: 600 }}>{r.nome}</td>
-                      <td style={{ fontSize: 11.5, color: "var(--ink-3)" }}>{r.formula}</td>
+                      <td style={{ fontWeight: 600 }} title={r.formula}>{r.nome}<div className="ind-formula-sotto">{r.formula}</div></td>
+                      <td className="ind-formula" style={{ fontSize: 11.5, color: "var(--ink-3)" }}>{r.formula}</td>
                       {r.valori.map((v, i) => (
                         <td key={i} className={"num " + cellaCls(r, i)} style={{ fontWeight: i === 0 ? 700 : 400, color: i === 0 ? undefined : "var(--ink-3)", whiteSpace: "nowrap" }}>
                           {i === 0 && freccia(r) ? <span style={{ fontSize: 10, marginRight: 4 }}>{freccia(r)}</span> : null}{fmtIndice(v, r.unita)}
@@ -17909,7 +17934,7 @@ function SBEsplora({ stagione, prospetti, rfDir, movimenti, saldiIniziali, conti
         <button className="btn ghost" onClick={esportaExcel}>↧ Excel con livelli</button>
       </div>
       <div className="card" style={{ overflowX: "auto", padding: "8px 12px" }}>
-        <table className="tbl" style={{ minWidth: conf ? 820 : 560 }}>
+        <table className="tbl esp-tbl" style={{ minWidth: conf ? 820 : 560 }}>
           <thead><tr>
             <th>Voce · conto · scrittura</th><th className="num">{stagione}</th>
             {conf && <th className="num">{prec.stagione}</th>}{conf && <th className="num">Δ</th>}{conf && variazioni && <th className="num">Δ %</th>}
